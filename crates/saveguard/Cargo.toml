@@ -1,0 +1,16 @@
+[package]
+name = "saveguard"
+description = "Save files without wrecking them: replace atomically when nothing would be lost, overwrite in place when something would, and report what happened."
+version.workspace = true
+edition.workspace = true
+keywords = ["file", "save", "atomic", "write", "filesystem"]
+categories = ["filesystem"]
+
+[target."cfg(unix)".dependencies]
+libc = "0.2.190"
+
+[target."cfg(unix)".dev-dependencies]
+libc = "0.2.190"
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }

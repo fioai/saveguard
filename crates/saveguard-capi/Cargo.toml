@@ -1,0 +1,13 @@
+[package]
+name = "saveguard-capi"
+description = "The C API of saveguard: save files without wrecking them, from any language with a C FFI."
+version.workspace = true
+edition.workspace = true
+
+[lib]
+# libsaveguard.so / .dylib / .dll, and libsaveguard.a; see include/saveguard.h.
+name = "saveguard"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+sg = { package = "saveguard", path = "../saveguard", version = "0.1.0" }

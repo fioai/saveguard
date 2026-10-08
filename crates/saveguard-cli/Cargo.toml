@@ -1,0 +1,12 @@
+[package]
+name = "saveguard-cli"
+description = "Save standard input to a file without wrecking it: atomic when nothing would be lost, in place when something would."
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "saveguard"
+path = "src/main.rs"
+
+[dependencies]
+saveguard = { path = "../saveguard", version = "0.1.0" }
