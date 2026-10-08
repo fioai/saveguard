@@ -425,17 +425,14 @@ fn match_security(staged: &File, original: &Original) -> Result<(), Failure> {
         lost: Lost::Acl,
         detail: format!("the access control list: {detail}"),
     };
-    // The file being replaced: through the handle opened when the save began or, when another
-    // save has replaced it since (that handle then reaches a deleted file), whatever is at the
-    // path now, which is what this save will replace.
-    let theirs = original
-        .file
-        .as_ref()
-        .and_then(|file| Security::of(file).ok())
-        .or_else(|| {
-            let file = open_with(&original.path, READ_CONTROL).ok()?;
-            Security::of(&file).ok()
-        })
+    // The file being replaced is the one at the path now. Not the handle opened when the save
+    // began: if another save has replaced the file since, that handle reaches a deleted file,
+    // which Windows has moved out of its directory, and whose ACL then reads as the inherited
+    // entries turned into entries of its own (seen in CI). The handle is only a fallback.
+    let theirs = open_with(&original.path, READ_CONTROL)
+        .ok()
+        .and_then(|file| Security::of(&file).ok())
+        .or_else(|| original.file.as_ref().and_then(|f| Security::of(f).ok()))
         .ok_or_else(|| acl("it can't be read".into()))?;
     let ours = Security::of(staged).map_err(|e| acl(e.to_string()))?;
     if !theirs.same_owner(&ours) {
