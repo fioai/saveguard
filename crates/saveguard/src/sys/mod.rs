@@ -3,10 +3,10 @@
 //! - `inspect(path)`: the existing file, if any, as an `Original` (with `is_file`, `is_symlink`,
 //!   `facts`)
 //! - `writable(path)`, `dir_writable(dir)`, `is_denied(error)`
-//! - `create_staged(dir, name, mode)`: a new, empty, uniquely named file; `mode` `None` means
-//!   private to this user, for contents replacing an existing file
-//! - `prepare(staged, original, failures)`: what must be copied before any data is written
-//! - `copy_metadata(staged, original, failures)`: what is copied after
+//! - `create_staged(dir, name, stage)`: a new, empty, uniquely named file (see [`Stage`])
+//! - `prepare(staged, original, private_on_failure, failures)`: what must be matched before any
+//!   data is written
+//! - `copy_metadata(staged, staged_path, original, failures)`: what is copied after
 //! - `replace(staged_file, staged, target, put, sync)`: puts the staged file at the target
 //! - `rename_refused(error)`: whether a failed replace should fall back to overwriting
 //! - `open_existing(target, original)`: opens the target for an overwrite, if it's still the
@@ -87,24 +87,31 @@ pub(crate) struct OverwriteError {
     pub error: io::Error,
 }
 
-/// A replace that failed.
+/// A replace that failed. Nothing changed at the target.
 pub(crate) struct ReplaceError {
     pub error: io::Error,
     /// The staged file, still open, where the platform could keep it open.
     pub file: Option<File>,
-    /// Set when the replace got partway and couldn't be undone: the old contents are at this path
-    /// and the target may be missing. Nothing more may be tried, and the staged file must be kept.
-    pub stranded: Option<PathBuf>,
 }
 
 impl ReplaceError {
     pub fn new(error: io::Error, file: Option<File>) -> ReplaceError {
-        ReplaceError {
-            error,
-            file,
-            stranded: None,
-        }
+        ReplaceError { error, file }
     }
+}
+
+/// What a staged file is for, which decides who may read it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Stage {
+    /// A file where there was none (or only a symlink): created with this mode, less the umask, or
+    /// with the directory's inherited ACL, like any new file.
+    New(u32),
+    /// Contents that will replace an existing file. They're never more readable than the
+    /// original: on Unix the file is `0600` until it gets the original's permissions at the end;
+    /// on Windows `prepare` matches its ACL to the original's before anything is written.
+    Replacement,
+    /// A copy kept only to overwrite the target from: private to this user.
+    Copy,
 }
 
 /// A fresh name for a staged file, with the target's name in it so that a copy left by a crash

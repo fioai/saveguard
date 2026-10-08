@@ -63,13 +63,13 @@ fn fail_with(e: &Error) -> c_int {
         Error::ReadOnly { .. } => ERR_READ_ONLY,
         Error::SymlinkLoop { .. } => ERR_SYMLINK_LOOP,
         Error::Untrusted { .. } => ERR_UNTRUSTED,
-        Error::Interrupted { .. } | Error::Stranded { .. } => ERR_INTERRUPTED,
+        Error::Interrupted { .. } => ERR_INTERRUPTED,
         _ => ERR_IO,
     };
     let os_error = match e {
-        Error::Io { source, .. }
-        | Error::Interrupted { source, .. }
-        | Error::Stranded { source, .. } => source.raw_os_error().unwrap_or(0),
+        Error::Io { source, .. } | Error::Interrupted { source, .. } => {
+            source.raw_os_error().unwrap_or(0)
+        }
         _ => 0,
     };
     fail(code, e.to_string(), os_error)

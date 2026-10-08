@@ -415,3 +415,17 @@ fn hard_links_are_kept_by_overwriting() {
     assert_eq!(read(&other), "new");
     assert!(leftovers(dir.path()).is_empty());
 }
+
+/// Where a file's creation time can be set (macOS, Windows), a replacement keeps it.
+#[cfg(any(windows, target_os = "macos"))]
+#[test]
+fn a_replacement_keeps_the_creation_time() {
+    let dir = TempDir::new();
+    let path = dir.join("a.txt");
+    fs::write(&path, "old").unwrap();
+    let created = fs::metadata(&path).unwrap().created().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let report = saveguard::save(&path, "new").unwrap();
+    assert_eq!(report.method, Method::Replaced, "{report}");
+    assert_eq!(fs::metadata(&path).unwrap().created().unwrap(), created);
+}

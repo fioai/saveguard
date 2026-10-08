@@ -9,7 +9,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
-use super::{Facts, Failure, OverwriteError, Put, ReplaceError, Staged};
+use super::{Facts, Failure, OverwriteError, Put, ReplaceError, Stage, Staged};
 use crate::version::Stamp;
 use crate::Lost;
 
@@ -271,13 +271,13 @@ pub(crate) fn dir_writable(dir: &Path) -> bool {
     access(dir, libc::W_OK | libc::X_OK).is_ok()
 }
 
-/// A new, empty file in `dir`: with `mode` (less the umask), or private to this user (`0600`) when
-/// `mode` is `None`.
-pub(crate) fn create_staged(
-    dir: &Path,
-    name: Option<&OsStr>,
-    mode: Option<u32>,
-) -> io::Result<Staged> {
+/// A new, empty file in `dir`, with the mode for a [`Stage::New`] file (less the umask), or
+/// private to this user (`0600`).
+pub(crate) fn create_staged(dir: &Path, name: Option<&OsStr>, stage: Stage) -> io::Result<Staged> {
+    let mode = match stage {
+        Stage::New(mode) => mode,
+        Stage::Replacement | Stage::Copy => 0o600,
+    };
     let mut collisions = 0;
     loop {
         let path = dir.join(super::temp_name(name));
@@ -285,7 +285,7 @@ pub(crate) fn create_staged(
             .read(true)
             .write(true)
             .create_new(true)
-            .mode(mode.unwrap_or(0o600))
+            .mode(mode)
             .open(&path)
         {
             Ok(file) => return Ok(Staged { file, path }),
@@ -297,8 +297,14 @@ pub(crate) fn create_staged(
     }
 }
 
-/// Copies what has to be set while the staged file is still empty.
-pub(crate) fn prepare(staged: &File, original: &Original, failures: &mut Vec<Failure>) {
+/// Copies what has to be set while the staged file is still empty. (It's private until the end
+/// anyway, so `private_on_failure` has nothing to do here.)
+pub(crate) fn prepare(
+    staged: &File,
+    original: &Original,
+    _private_on_failure: bool,
+    failures: &mut Vec<Failure>,
+) {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     if let Some(from) = &original.file {
         linux::copy_flags(from, staged, failures);
@@ -310,7 +316,12 @@ pub(crate) fn prepare(staged: &File, original: &Original, failures: &mut Vec<Fai
 /// Gives the staged file the original's extended attributes (including the ACL and security label
 /// on Linux), ACL (macOS), owner, group, permissions and flags. Whatever won't copy is added to
 /// `failures`.
-pub(crate) fn copy_metadata(staged: &File, original: &Original, failures: &mut Vec<Failure>) {
+pub(crate) fn copy_metadata(
+    staged: &File,
+    _staged_path: &Path,
+    original: &Original,
+    failures: &mut Vec<Failure>,
+) {
     match &original.file {
         Some(from) => copy_xattrs(from, staged, failures),
         None => failures.push(Failure {

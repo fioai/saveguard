@@ -91,19 +91,26 @@ The tests were checked by breaking each fix on purpose, and each test then faile
 
 ## Windows
 
-`ReplaceFileW` gives the new file the old one's attributes, ACLs, alternate data streams, object ID and creation time, so there's no metadata to copy. It fails rather than lose them, because no `IGNORE_*_ERRORS` flags are passed. It's called with a backup name, so the old file is moved aside rather than deleted, because of what its documentation says about two of its errors:
+The same plan as on Unix: give the staged file everything the original had, then rename it over the original in one step.
 
-- `ERROR_UNABLE_TO_MOVE_REPLACEMENT` (1176): with a backup name nothing has changed, so Auto overwrites instead. Without one, the old file is already gone.
-- `ERROR_UNABLE_TO_MOVE_REPLACEMENT_2` (1177): the old file is at the backup name and the new one is still staged. The staged file is moved into place, or if that fails, the backup is moved back. If both fail, the save stops with `Error::Stranded`, which names both files. Nothing more is tried, and nothing is deleted.
+The first version used `ReplaceFileW` instead, because it carries the metadata over by itself. CI showed it isn't atomic: it moves the original aside before moving the new file in, and in between there's no file at the path. A reader got "not found", and concurrent saves raced into the gap.
 
-Sharing violations, lock violations, access denied and 1175 (`UNABLE_TO_REMOVE_REPLACED`) are retried with backoff for about half a second. Virus scanners, indexers and sync clients open files briefly. After that, Auto overwrites in place, which only needs write sharing. Deleting the backup afterwards is retried the same way.
+What's matched, and how:
 
-Other details:
+- **Owner and ACL:** in `prepare`, before anything is written. If the owner differs from the staged file's (the original belongs to someone else), it's a failure, so Auto overwrites in place. Then the ACLs are compared byte for byte:
+  - the same (both inherited from the directory, the usual case): nothing to do;
+  - the original's is its own (protected): the staged file gets a copy (`SetSecurityInfo`);
+  - otherwise (entries of its own on top of inherited ones, or a directory whose ACL changed since): a failure, and the staged file is made private, since it's now only a copy to overwrite from.
+- **Attributes and creation time:** hidden, system and not-indexed, plus the creation time, via `SetFileInformationByHandle(FileBasicInfo)`. A compression or encryption mismatch is a failure.
+- **Alternate data streams,** such as the `Zone.Identifier` that marks a downloaded file: enumerated with `FindFirstStreamW` and copied one by one.
 
-- **The staged file** for a replace is created with `CreateFileW` and the DACL `D:P(A;;FA;;;OW)`: protected, so nothing is inherited from the directory, with all access for the owner. `ReplaceFileW` gives it the original's DACL at the end.
-- **Durability:** `ReplaceFileW` has no write-through option (its `REPLACEFILE_WRITE_THROUGH` is documented as unsupported), so with `Durability::Full` the file is flushed after the replace, as the best available.
+The other details:
+
+- **The rename:** `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`. When the target is open, that's refused, and std's `fs::rename` then uses a POSIX-semantics rename (`FileRenameInfoEx`), which works while others have the file open (if they allow deletion). Sharing violations, lock violations and access denied are retried with backoff for about half a second: virus scanners, indexers and sync clients open files briefly. After that, Auto overwrites in place, which only needs write sharing.
+- **Durability:** `MOVEFILE_WRITE_THROUGH` unless `Durability::None`. The POSIX-semantics rename has no such option, so the file is flushed after it, as the best available.
+- **Staged files:** a copy kept only to overwrite from is created private, with the DACL `D:P(A;;FA;;;OW)`: protected, all access for the owner.
 - **Overwrites in place** lock one byte far past the end of the file with `LockFileEx`. Windows locks are mandatory, and locking the contents would make other programs' reads fail rather than wait.
-- **New files, replaced symlinks and exclusive creation** use `MoveFileExW`, with `MOVEFILE_WRITE_THROUGH` unless `Durability::None` and `MOVEFILE_REPLACE_EXISTING` unless exclusive.
+- **Exclusive creation** uses `MoveFileExW` without `REPLACE_EXISTING`.
 - **Read-only:** the read-only attribute counts as read-only.
 - **Identity:** `GetFileInformationByHandle` supplies the hard-link count, the identity check (volume serial and file index), and the version (those plus size and last-write time).
 
@@ -129,8 +136,8 @@ The hash is std's SipHash with fixed keys. It's for noticing accidental changes,
   - an inherited ACL isn't removed if the original has none, because `fcopyfile` decides that;
   - system attributes such as `com.apple.provenance` may refuse to be copied, which would turn every replace of such files into an overwrite. Check this on the first real run.
 - **Windows:**
-  - the owner SID may not survive `ReplaceFileW` when saving another user's file;
-  - a backup the replace leaves that still can't be deleted after the retries stays, under the target's name;
+  - an ACL with entries of its own on top of inherited ones isn't reproduced on a new file, so such files are overwritten in place;
+  - the short (8.3) name and object ID aren't carried over;
   - see "Windows" above for durability.
 - **Network file systems:** rename atomicity on NFS holds per client, and some FUSE file systems (sshfs without `-o workaround=rename`) refuse to rename over a file. Auto then overwrites. `flock` may not lock on some of them, in which case overwrites carry on unlocked.
 - **Concurrent writers:**

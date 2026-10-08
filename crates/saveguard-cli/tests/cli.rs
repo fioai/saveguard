@@ -247,6 +247,10 @@ fn a_link_planted_in_a_shared_directory_is_not_followed() {
     let dir = TempDir::new();
     let script = r#"
         set -e
+        # A namespace where only root is mapped (no /etc/subuid range) has no second user.
+        touch probe
+        if ! chown 1:1 probe 2>/dev/null; then echo 'no second user'; exit 0; fi
+        rm probe
         mkdir shared victim
         chmod 1777 shared
         printf 'precious\n' > victim/precious.txt
@@ -265,6 +269,10 @@ fn a_link_planted_in_a_shared_directory_is_not_followed() {
     let Some(out) = in_namespace_with(&["--map-auto", "--map-root-user"], &dir.0, script) else {
         return;
     };
+    if text(&out.stdout) == "no second user\n" {
+        eprintln!("skipped: the user namespace has no second user to plant the link");
+        return;
+    }
     assert_eq!(
         text(&out.stdout),
         "link: refused\nnew: refused\nfile: refused\nprecious\ntheirs\nprecious.txt\n",

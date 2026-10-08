@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::options::{Durability, Options, Strategy};
 use crate::resolve::{resolve, Target};
-use crate::sys::{self, Facts, Failure, Put, ReplaceError};
+use crate::sys::{self, Facts, Failure, Put, ReplaceError, Stage};
 use crate::version::{self, ContentHash, Stamp, State};
 use crate::{Error, Lost, Method, Plan, Reason, Report, Result, Version};
 
@@ -211,8 +211,9 @@ pub(crate) fn open(opts: &Options, path: &Path) -> Result<Writer> {
     let mut failures = Vec::new();
     if decision.method == Method::Replaced {
         if let Some(o) = original.as_ref().filter(|o| o.is_file()) {
-            // Some file flags can only be set while the file is empty.
-            sys::prepare(&staged.file, o, &mut failures);
+            // Some file flags, and on Windows the ACL, are matched while the file is empty.
+            let private_on_failure = opts.strategy == Strategy::Auto;
+            sys::prepare(&staged.file, o, private_on_failure, &mut failures);
         }
     }
     Ok(Writer {
@@ -242,15 +243,15 @@ fn stage(
     existing: Existing,
 ) -> Result<sys::Staged> {
     let name = target.file.file_name();
-    // A file that replaces another starts private and gets the original's permissions at the end,
-    // so a secret file is never briefly readable by others. A file where there was none (or only a
-    // link) gets its mode, and the umask or the directory's default ACL, at creation, like any
-    // other.
-    let mode = match existing {
-        Existing::Nothing | Existing::Link => Some(opts.mode.unwrap_or(0o666)),
-        Existing::File(_) => None,
+    // A file where there was none (or only a link) gets its mode, and the umask or the
+    // directory's default ACL, like any new file. Contents for an existing file are never more
+    // readable than it was while they're written (see `Stage`).
+    let kind = match existing {
+        Existing::Nothing | Existing::Link => Stage::New(opts.mode.unwrap_or(0o666)),
+        Existing::File(_) if decision.method == Method::Replaced => Stage::Replacement,
+        Existing::File(_) => Stage::Copy,
     };
-    match sys::create_staged(&target.dir, name, mode) {
+    match sys::create_staged(&target.dir, name, kind) {
         Ok(staged) => Ok(staged),
         Err(e)
             if matches!(existing, Existing::File(_))
@@ -262,7 +263,7 @@ fn stage(
                 decision.reasons.push(Reason::DirectoryNotWritable);
             }
             let dir = sys::fallback_dir();
-            sys::create_staged(&dir, name, None)
+            sys::create_staged(&dir, name, Stage::Copy)
                 .map_err(|e| Error::io("create a temporary file in", dir, e))
         }
         Err(e) => Err(Error::io("create a temporary file in", &target.dir, e)),
@@ -281,7 +282,7 @@ impl Writer {
     }
 
     /// Puts the new contents in place and says how that went. On an error the target is unchanged,
-    /// except after [`Error::Interrupted`] and [`Error::Stranded`].
+    /// except after [`Error::Interrupted`].
     pub fn commit(mut self) -> Result<Report> {
         let pending = self
             .pending
@@ -390,7 +391,7 @@ impl Pending {
         // the old file instead, which keeps it all.
         if method == Method::Replaced {
             if let Some(o) = original_file {
-                sys::copy_metadata(&file, o, &mut failures);
+                sys::copy_metadata(&file, &staged, o, &mut failures);
             }
             if !failures.is_empty() {
                 if strategy == Strategy::Auto {
@@ -429,19 +430,6 @@ impl Pending {
                 };
                 match sys::replace(file, &staged, &target.file, put, sync) {
                     Ok(stamp) => stamp,
-                    Err(ReplaceError {
-                        error,
-                        stranded: Some(old),
-                        ..
-                    }) => {
-                        cleanup.disarm();
-                        return Err(Error::Stranded {
-                            path: target.file,
-                            old,
-                            new: staged,
-                            source: error,
-                        });
-                    }
                     Err(ReplaceError { error, .. })
                         if put == Put::NewExclusive
                             && error.kind() == io::ErrorKind::AlreadyExists =>
