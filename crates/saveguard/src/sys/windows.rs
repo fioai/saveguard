@@ -30,7 +30,7 @@ use windows_sys::Win32::Security::Authorization::{
 };
 use windows_sys::Win32::Security::{
     AclSizeInformation, EqualSid, GetAclInformation, GetSecurityDescriptorControl,
-    GetSecurityDescriptorDacl, ACL, ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION,
+    GetSecurityDescriptorDacl, ACL, ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION, INHERITED_ACE,
     OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
     SECURITY_ATTRIBUTES, SE_DACL_PROTECTED,
 };
@@ -441,17 +441,49 @@ fn match_security(staged: &File, original: &Original) -> Result<(), Failure> {
             detail: "the owner: a new file would belong to this user".into(),
         });
     }
-    if theirs.entries().is_some() && theirs.entries() == ours.entries() {
-        return Ok(());
-    }
     if theirs.protected() && !theirs.dacl.is_null() {
         return set_protected_dacl(staged, theirs.dacl).map_err(|e| acl(e.to_string()));
+    }
+    if let (Some(a), Some(b)) = (theirs.entries(), ours.entries()) {
+        if same_entries(a, b) {
+            return Ok(());
+        }
     }
     Err(acl(format!(
         "it has entries of its own that a new file wouldn't inherit ({} where a new file gets {})",
         theirs.sddl(),
         ours.sddl()
     )))
+}
+
+/// Whether two lists of ACL entries grant the same: the same entries in the same order, whether or
+/// not an entry is marked as inherited. A file can hold its directory's inherited entries as
+/// entries of its own (Windows does that to a file it has moved aside after a replace), and a new
+/// file there inherits the same entries, so the access is the same.
+fn same_entries(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let inherited = INHERITED_ACE as u8;
+    let mut i = 0;
+    while i < a.len() {
+        // ACE_HEADER: type, flags, size (little-endian u16), then the body.
+        if i + 4 > a.len() {
+            return false;
+        }
+        let size = usize::from(u16::from_le_bytes([a[i + 2], a[i + 3]]));
+        if size < 4 || i + size > a.len() || a[i + 2..i + 4] != b[i + 2..i + 4] {
+            return false;
+        }
+        if a[i] != b[i]
+            || a[i + 1] & !inherited != b[i + 1] & !inherited
+            || a[i + 4..i + size] != b[i + 4..i + size]
+        {
+            return false;
+        }
+        i += size;
+    }
+    true
 }
 
 /// After the contents: the creation time, the attributes, and the alternate data streams.
@@ -746,6 +778,26 @@ pub(crate) fn stamp_at(path: &Path) -> io::Result<Option<Stamp>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An ACE: type 0 (allow), the given flags, size 8, and a 4-byte body.
+    fn ace(flags: u8, body: [u8; 4]) -> Vec<u8> {
+        let mut v = vec![0, flags, 8, 0];
+        v.extend_from_slice(&body);
+        v
+    }
+
+    #[test]
+    fn entries_match_whether_or_not_inherited() {
+        let inherited = [ace(0x10, [1, 2, 3, 4]), ace(0x10, [5, 6, 7, 8])].concat();
+        let explicit = [ace(0, [1, 2, 3, 4]), ace(0, [5, 6, 7, 8])].concat();
+        assert!(same_entries(&inherited, &explicit));
+        let different = [ace(0, [1, 2, 3, 4]), ace(0, [5, 6, 7, 9])].concat();
+        assert!(!same_entries(&inherited, &different));
+        let extra = [explicit.clone(), ace(0, [9, 9, 9, 9])].concat();
+        assert!(!same_entries(&explicit, &extra));
+        let other_flags = [ace(0x01, [1, 2, 3, 4]), ace(0, [5, 6, 7, 8])].concat();
+        assert!(!same_entries(&explicit, &other_flags));
+    }
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
