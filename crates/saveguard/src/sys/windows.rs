@@ -24,13 +24,15 @@ use windows_sys::Win32::Foundation::{
     GENERIC_WRITE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Security::Authorization::{
+    ConvertSecurityDescriptorToStringSecurityDescriptorW,
     ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SetSecurityInfo,
     SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    EqualSid, GetSecurityDescriptorControl, GetSecurityDescriptorDacl, ACL,
-    DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
-    PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, SE_DACL_PROTECTED,
+    AclSizeInformation, EqualSid, GetAclInformation, GetSecurityDescriptorControl,
+    GetSecurityDescriptorDacl, ACL, ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION,
+    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    SECURITY_ATTRIBUTES, SE_DACL_PROTECTED,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FileBasicInfo, FindClose, FindFirstStreamW, FindNextStreamW,
@@ -319,12 +321,54 @@ impl Security {
         control & SE_DACL_PROTECTED != 0
     }
 
-    fn dacl_bytes(&self) -> Option<&[u8]> {
+    /// The DACL's entries, as bytes. Not the header, whose size field can count unused space
+    /// after the entries, which makes equal lists of entries compare unequal.
+    fn entries(&self) -> Option<&[u8]> {
         if self.dacl.is_null() {
             return None;
         }
-        let len = usize::from(unsafe { (*self.dacl).AclSize });
-        Some(unsafe { std::slice::from_raw_parts(self.dacl.cast::<u8>(), len) })
+        let mut size = ACL_SIZE_INFORMATION {
+            AceCount: 0,
+            AclBytesInUse: 0,
+            AclBytesFree: 0,
+        };
+        let ok = unsafe {
+            GetAclInformation(
+                self.dacl,
+                (&mut size as *mut ACL_SIZE_INFORMATION).cast::<c_void>(),
+                std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+        };
+        let header = std::mem::size_of::<ACL>();
+        let used = size.AclBytesInUse as usize;
+        if ok == 0 || used < header {
+            return None;
+        }
+        Some(unsafe {
+            std::slice::from_raw_parts(self.dacl.cast::<u8>().add(header), used - header)
+        })
+    }
+
+    /// The DACL in SDDL, for messages.
+    fn sddl(&self) -> String {
+        let mut text: *mut u16 = ptr::null_mut();
+        let mut len = 0u32;
+        let ok = unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                self.descriptor,
+                SDDL_REVISION_1,
+                DACL_SECURITY_INFORMATION,
+                &mut text,
+                &mut len,
+            )
+        };
+        if ok == 0 || text.is_null() {
+            return "?".into();
+        }
+        let s = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, len as usize) });
+        unsafe { LocalFree(text.cast()) };
+        s.trim_end_matches('\0').to_string()
     }
 }
 
@@ -400,15 +444,17 @@ fn match_security(staged: &File, original: &Original) -> Result<(), Failure> {
             detail: "the owner: a new file would belong to this user".into(),
         });
     }
-    if theirs.dacl_bytes() == ours.dacl_bytes() {
+    if theirs.entries().is_some() && theirs.entries() == ours.entries() {
         return Ok(());
     }
     if theirs.protected() && !theirs.dacl.is_null() {
         return set_protected_dacl(staged, theirs.dacl).map_err(|e| acl(e.to_string()));
     }
-    Err(acl(
-        "it has entries of its own that a new file wouldn't inherit".into(),
-    ))
+    Err(acl(format!(
+        "it has entries of its own that a new file wouldn't inherit ({} where a new file gets {})",
+        theirs.sddl(),
+        ours.sddl()
+    )))
 }
 
 /// After the contents: the creation time, the attributes, and the alternate data streams.
