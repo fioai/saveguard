@@ -17,7 +17,7 @@ jobs:
         with:
           components: clippy
       - name: Test
-        run: cargo test --workspace -- --nocapture
+        run: cargo test --workspace --no-fail-fast -- --nocapture
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 

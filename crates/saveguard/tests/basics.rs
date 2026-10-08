@@ -355,16 +355,30 @@ fn concurrent_saves_leave_one_complete_version() {
             thread::spawn(move || {
                 let mut opts = Options::new();
                 opts.durability(Durability::None);
+                // Every save that didn't simply replace, and why: the evidence when this fails.
+                let mut odd = Vec::new();
                 for _ in 0..25 {
-                    opts.save(&*path, vec![b'0' + t; 10_000 + usize::from(t)])
-                        .unwrap();
+                    match opts.save(&*path, vec![b'0' + t; 10_000 + usize::from(t)]) {
+                        Ok(report) if report.method == Method::Replaced => {}
+                        Ok(report) => odd.push(format!("ok: {report}")),
+                        Err(e) => odd.push(format!("error: {e} ({e:?})")),
+                    }
                 }
+                odd
             })
         })
         .collect();
-    for t in threads {
-        t.join().unwrap();
+    let odd: Vec<String> = threads
+        .into_iter()
+        .flat_map(|t| t.join().unwrap())
+        .collect();
+    for line in &odd {
+        eprintln!("{line}");
     }
+    assert!(
+        odd.iter().all(|line| !line.starts_with("error")),
+        "{odd:#?}"
+    );
     let last = fs::read(&*path).unwrap();
     let t = last[0] - b'0';
     assert_eq!(last, vec![b'0' + t; 10_000 + usize::from(t)]);

@@ -38,7 +38,10 @@ fn saveguard(args: &[&str], input: &[u8]) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    child.stdin.take().unwrap().write_all(input).unwrap();
+    // The tool may finish (say, with an error) before reading its input.
+    if let Err(e) = child.stdin.take().unwrap().write_all(input) {
+        assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe, "{e}");
+    }
     child.wait_with_output().unwrap()
 }
 
