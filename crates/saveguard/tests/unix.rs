@@ -6,9 +6,13 @@ mod common;
 use std::fs;
 use std::os::unix::fs::symlink;
 
+use std::io::Write;
+use std::sync::{Arc, Barrier};
+use std::thread;
+
 use common::unix::{chgrp, ino, is_root, mode, other_group, set_mode, umask};
 use common::{leftovers, read, skip, temp_dir_lock, TempDir};
-use saveguard::{Error, Lost, Method, Options, Reason, Strategy};
+use saveguard::{Durability, Error, Lost, Method, Options, Reason, Strategy};
 
 #[test]
 fn a_replacement_keeps_the_permissions() {
@@ -56,9 +60,6 @@ fn a_new_file_gets_the_mode_asked_for_less_the_umask() {
 
 #[test]
 fn setuid_is_cleared_as_the_kernel_would() {
-    if is_root() {
-        return skip("root keeps setuid");
-    }
     let dir = TempDir::new();
     let path = dir.join("tool");
     fs::write(&path, "old").unwrap();
@@ -175,7 +176,7 @@ fn a_file_in_a_read_only_directory_is_overwritten_in_place() {
         return skip("root can write to a read-only directory");
     }
     let _lock = temp_dir_lock();
-    let before_tmp = leftovers(&std::env::temp_dir()).len();
+    let before_tmp = leftovers(&fallback_dir()).len();
     let dir = TempDir::new();
     let sub = dir.join("locked");
     fs::create_dir(&sub).unwrap();
@@ -191,7 +192,17 @@ fn a_file_in_a_read_only_directory_is_overwritten_in_place() {
     assert_eq!((plan.method, plan.reasons), (report.method, report.reasons));
     assert_eq!(read(&path), "new");
     assert_eq!(ino(&path), before);
-    assert_eq!(leftovers(&std::env::temp_dir()).len(), before_tmp);
+    assert_eq!(leftovers(&fallback_dir()).len(), before_tmp);
+}
+
+/// Where saves stage when the directory is read-only: somewhere that survives a reboot.
+fn fallback_dir() -> std::path::PathBuf {
+    let var_tmp = std::path::Path::new("/var/tmp");
+    if var_tmp.is_dir() {
+        var_tmp.into()
+    } else {
+        std::env::temp_dir()
+    }
 }
 
 #[test]
@@ -252,4 +263,144 @@ fn a_fifo_is_not_a_file() {
     assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
     let err = saveguard::save(&path, "x").unwrap_err();
     assert!(matches!(err, Error::NotAFile { .. }), "{err}");
+}
+
+#[test]
+fn create_new_refuses_a_symlink_even_one_to_nothing() {
+    let dir = TempDir::new();
+    let link = dir.join("link.txt");
+    symlink("elsewhere.txt", &link).unwrap();
+    let err = Options::new()
+        .create_new(true)
+        .save(&link, "x")
+        .unwrap_err();
+    assert!(matches!(err, Error::Exists { .. }), "{err}");
+    assert!(!dir.join("elsewhere.txt").exists());
+}
+
+#[test]
+fn replacing_a_link_gives_the_mode_of_a_new_file() {
+    let Some(umask) = umask() else {
+        return skip("can't read the umask");
+    };
+    let dir = TempDir::new();
+    let link = dir.join("link.txt");
+    symlink("elsewhere.txt", &link).unwrap();
+    Options::new()
+        .follow_symlinks(false)
+        .mode(0o644)
+        .save(&link, "x")
+        .unwrap();
+    assert_eq!(mode(&link), 0o644 & !umask);
+}
+
+/// Two saves overwriting the same file in place must take turns, or the file ends up with the
+/// start of one and the end of the other.
+#[test]
+fn overwrites_in_place_take_turns() {
+    let dir = TempDir::new();
+    let path = Arc::new(dir.join("a.txt"));
+    fs::write(&*path, "old").unwrap();
+    fs::hard_link(&*path, dir.join("b.txt")).unwrap();
+    // Big enough that the copies overlap, and of different lengths so a mixture can't hide.
+    let a = vec![b'a'; 12 << 20];
+    let b = vec![b'b'; 9 << 20];
+    for _ in 0..12 {
+        let start = Arc::new(Barrier::new(2));
+        let threads: Vec<_> = [a.clone(), b.clone()]
+            .into_iter()
+            .map(|contents| {
+                let (path, start) = (Arc::clone(&path), Arc::clone(&start));
+                thread::spawn(move || {
+                    let mut w = Options::new()
+                        .durability(Durability::None)
+                        .open(&*path)
+                        .unwrap();
+                    w.write_all(&contents).unwrap();
+                    start.wait();
+                    assert_eq!(w.commit().unwrap().method, Method::Overwrote);
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let now = fs::read(&*path).unwrap();
+        assert!(
+            now == a || now == b,
+            "the file is a mixture of the two saves"
+        );
+    }
+}
+
+/// The overwrite is of the file that was inspected, or nothing: if something else is at the path
+/// by the time of the commit (here another program replaced the file; in an attack, a directory on
+/// the path became a symlink), it's a conflict.
+#[test]
+fn a_different_file_at_the_path_is_not_overwritten() {
+    let dir = TempDir::new();
+    let path = dir.join("a.txt");
+    fs::write(&path, "old").unwrap();
+    fs::hard_link(&path, dir.join("b.txt")).unwrap();
+    let mut w = Options::new().open(&path).unwrap();
+    assert_eq!(w.method(), Method::Overwrote);
+    w.write_all(b"new").unwrap();
+    let other = dir.join("other.txt");
+    fs::write(&other, "someone else's").unwrap();
+    fs::rename(&other, &path).unwrap();
+    let err = w.commit().unwrap_err();
+    assert!(matches!(err, Error::Conflict { .. }), "{err}");
+    assert_eq!(read(&path), "someone else's");
+    assert_eq!(read(&dir.join("b.txt")), "old");
+    assert!(leftovers(dir.path()).is_empty());
+}
+
+#[test]
+fn setgid_is_kept_for_a_writer_in_the_group_unless_group_executable() {
+    if is_root() {
+        return skip("root keeps setgid either way");
+    }
+    let dir = TempDir::new();
+    let path = dir.join("a.txt");
+    fs::write(&path, "old").unwrap();
+    set_mode(&path, 0o2644);
+    let report = saveguard::save(&path, "new").unwrap();
+    assert!(report.lost.is_empty(), "{report}");
+    assert_eq!(mode(&path), 0o2644);
+    set_mode(&path, 0o2755);
+    let report = saveguard::save(&path, "newer").unwrap();
+    assert_eq!(report.lost, vec![Lost::SetId]);
+    assert_eq!(mode(&path), 0o755);
+}
+
+#[test]
+fn forced_replace_of_an_unreadable_file_says_what_it_may_have_lost() {
+    if is_root() {
+        return skip("root can read anything");
+    }
+    let dir = TempDir::new();
+    let path = dir.join("a.txt");
+    fs::write(&path, "old").unwrap();
+    set_mode(&path, 0o200);
+    let report = Options::new()
+        .strategy(Strategy::Replace)
+        .save(&path, "new")
+        .unwrap();
+    assert_eq!(report.method, Method::Replaced);
+    assert_eq!(report.lost, vec![Lost::UnreadableXattrs]);
+}
+
+#[test]
+fn our_own_link_in_a_shared_directory_is_followed() {
+    let dir = TempDir::new();
+    let shared = dir.join("shared");
+    fs::create_dir(&shared).unwrap();
+    set_mode(&shared, 0o1777);
+    fs::write(dir.join("real.txt"), "old").unwrap();
+    symlink("../real.txt", shared.join("link.txt")).unwrap();
+    fs::write(shared.join("own.txt"), "old").unwrap();
+    saveguard::save(shared.join("link.txt"), "new").unwrap();
+    assert_eq!(read(&dir.join("real.txt")), "new");
+    saveguard::save(shared.join("own.txt"), "new").unwrap();
+    assert_eq!(read(&shared.join("own.txt")), "new");
 }

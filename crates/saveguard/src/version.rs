@@ -156,7 +156,12 @@ impl ContentHash {
 }
 
 fn hash_file(path: &Path) -> io::Result<Contents> {
-    let mut file = File::open(path)?;
+    let mut options = File::options();
+    options.read(true);
+    // A FIFO put at the path would make a blocking open wait forever.
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NONBLOCK);
+    let mut file = options.open(path)?;
     let mut hash = ContentHash::new();
     let mut buf = vec![0; 64 * 1024];
     loop {

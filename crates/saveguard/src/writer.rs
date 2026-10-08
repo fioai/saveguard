@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use crate::options::{Durability, Options, Strategy};
 use crate::resolve::{resolve, Target};
-use crate::sys::{self, Facts, Failure, Put};
-use crate::version::{self, ContentHash, State};
+use crate::sys::{self, Facts, Failure, Put, ReplaceError};
+use crate::version::{self, ContentHash, Stamp, State};
 use crate::{Error, Lost, Method, Plan, Reason, Report, Result, Version};
 
 /// A save in progress, from [`Options::open`].
@@ -108,12 +108,31 @@ fn decision(method: Method, reasons: Vec<Reason>, lost: Vec<Lost>) -> Decision {
     }
 }
 
+/// Adds what was lost, once.
+fn add_lost(lost: &mut Vec<Lost>, more: impl IntoIterator<Item = Lost>) {
+    for item in more {
+        if !lost.contains(&item) {
+            lost.push(item);
+        }
+    }
+}
+
 fn existing(original: Option<&sys::Original>) -> Existing {
     match original {
         None => Existing::Nothing,
         Some(o) if o.is_file() => Existing::File(o.facts()),
         Some(_) => Existing::Link,
     }
+}
+
+/// Like `O_EXCL`, `create_new` treats a symlink at the path as the file existing, even one that
+/// points nowhere: otherwise whoever made the link would choose where the new file goes.
+fn refuse_link(opts: &Options, path: &Path) -> Result<()> {
+    if opts.create_new && fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
+    {
+        return Err(Error::Exists { path: path.into() });
+    }
+    Ok(())
 }
 
 /// Checks that apply before anything is written, to `open` and `plan` alike.
@@ -129,6 +148,11 @@ fn check(opts: &Options, target: &Target, original: Option<&sys::Original>) -> R
                 path: target.file.clone(),
             });
         }
+        if o.is_file() && !o.trusted(&target.file) {
+            return Err(Error::Untrusted {
+                path: target.file.clone(),
+            });
+        }
         if o.is_file()
             && !sys::writable(&target.file).map_err(|e| Error::io("inspect", &target.file, e))?
         {
@@ -137,13 +161,13 @@ fn check(opts: &Options, target: &Target, original: Option<&sys::Original>) -> R
             });
         }
     }
-    if let Some(expected) = &opts.expect {
-        if !version::unchanged(expected, &target.file)
-            .map_err(|e| Error::io("inspect", &target.file, e))?
-        {
-            return Err(Error::Conflict {
-                path: target.file.clone(),
-            });
+    check_unchanged(opts.expect.as_ref(), &target.file)
+}
+
+fn check_unchanged(expect: Option<&Version>, path: &Path) -> Result<()> {
+    if let Some(expected) = expect {
+        if !version::unchanged(expected, path).map_err(|e| Error::io("inspect", path, e))? {
+            return Err(Error::Conflict { path: path.into() });
         }
     }
     Ok(())
@@ -154,6 +178,7 @@ fn inspect(target: &Target) -> Result<Option<sys::Original>> {
 }
 
 pub(crate) fn plan(opts: &Options, path: &Path) -> Result<Plan> {
+    refuse_link(opts, path)?;
     let target = resolve(path, !opts.no_follow)?;
     let original = inspect(&target)?;
     check(opts, &target, original.as_ref())?;
@@ -176,6 +201,7 @@ pub(crate) fn plan(opts: &Options, path: &Path) -> Result<Plan> {
 }
 
 pub(crate) fn open(opts: &Options, path: &Path) -> Result<Writer> {
+    refuse_link(opts, path)?;
     let target = resolve(path, !opts.no_follow)?;
     let original = inspect(&target)?;
     check(opts, &target, original.as_ref())?;
@@ -207,22 +233,24 @@ pub(crate) fn open(opts: &Options, path: &Path) -> Result<Writer> {
 }
 
 /// Creates the file the new contents are written to: next to the target, so that it can be renamed
-/// over it, or, when that directory is closed to us and the target can be overwritten instead, in
-/// the temporary directory.
+/// over it, or, when that directory is closed to us and the target can be overwritten instead,
+/// somewhere that survives a reboot.
 fn stage(
     opts: &Options,
     target: &Target,
     decision: &mut Decision,
     existing: Existing,
 ) -> Result<sys::Staged> {
+    let name = target.file.file_name();
     // A file that replaces another starts private and gets the original's permissions at the end,
-    // so a secret file is never briefly readable by others. A new file gets its mode, and the
-    // umask or the directory's default ACL, at creation, like any other.
+    // so a secret file is never briefly readable by others. A file where there was none (or only a
+    // link) gets its mode, and the umask or the directory's default ACL, at creation, like any
+    // other.
     let mode = match existing {
-        Existing::Nothing => opts.mode.unwrap_or(0o666),
-        _ => 0o600,
+        Existing::Nothing | Existing::Link => Some(opts.mode.unwrap_or(0o666)),
+        Existing::File(_) => None,
     };
-    match sys::create_staged(&target.dir, mode) {
+    match sys::create_staged(&target.dir, name, mode) {
         Ok(staged) => Ok(staged),
         Err(e)
             if matches!(existing, Existing::File(_))
@@ -233,9 +261,9 @@ fn stage(
                 decision.method = Method::Overwrote;
                 decision.reasons.push(Reason::DirectoryNotWritable);
             }
-            let tmp = std::env::temp_dir();
-            sys::create_staged(&tmp, 0o600)
-                .map_err(|e| Error::io("create a temporary file in", tmp, e))
+            let dir = sys::fallback_dir();
+            sys::create_staged(&dir, name, None)
+                .map_err(|e| Error::io("create a temporary file in", dir, e))
         }
         Err(e) => Err(Error::io("create a temporary file in", &target.dir, e)),
     }
@@ -253,7 +281,7 @@ impl Writer {
     }
 
     /// Puts the new contents in place and says how that went. On an error the target is unchanged,
-    /// except after [`Error::Interrupted`].
+    /// except after [`Error::Interrupted`] and [`Error::Stranded`].
     pub fn commit(mut self) -> Result<Report> {
         let pending = self
             .pending
@@ -311,7 +339,8 @@ impl Drop for Writer {
     }
 }
 
-/// Deletes the staged file when a commit returns early, unless disarmed.
+/// Deletes the staged file when a commit ends, unless disarmed because it holds contents that
+/// would otherwise be lost. After a successful replace it no longer exists, and this does nothing.
 struct Cleanup(Option<PathBuf>);
 
 impl Cleanup {
@@ -334,7 +363,7 @@ impl Pending {
             target,
             original,
             decision,
-            mut failures,
+            failures,
             out,
             staged,
             hash,
@@ -348,8 +377,9 @@ impl Pending {
             mut reasons,
             mut lost,
         } = decision;
+        let mut failures = failures;
         let mut cleanup = Cleanup(Some(staged.clone()));
-        let file = out
+        let mut file = out
             .into_inner()
             .map_err(|e| Error::io("write the new contents to", &staged, e.into_error()))?;
         let contents = hash.finish();
@@ -367,7 +397,7 @@ impl Pending {
                     method = Method::Overwrote;
                     reasons.extend(failures.iter().map(|f| Reason::Metadata(f.detail.clone())));
                 } else {
-                    lost.extend(failures.iter().filter_map(|f| f.lost.clone()));
+                    add_lost(&mut lost, failures.iter().map(|f| f.lost.clone()));
                 }
             }
         }
@@ -379,17 +409,18 @@ impl Pending {
                 .map_err(|e| Error::io("flush the new contents to", &staged, e))?;
         }
 
-        if let Some(expected) = &expect {
-            if !version::unchanged(expected, &target.file)
-                .map_err(|e| Error::io("inspect", &target.file, e))?
-            {
-                return Err(Error::Conflict { path: target.file });
-            }
-        }
-
-        let exclusive = create_new || expect.as_ref().is_some_and(|v| !v.exists());
-        let stamp = match method {
-            Method::Created | Method::Replaced => {
+        let in_place = Overwrite {
+            staged: &staged,
+            target: &target.file,
+            len: contents.len,
+            sync,
+            expect: expect.as_ref(),
+        };
+        let stamp = match (method, original_file) {
+            (Method::Overwrote, Some(o)) => in_place.run(&mut file, o, &mut cleanup)?,
+            _ => {
+                check_unchanged(expect.as_ref(), &target.file)?;
+                let exclusive = create_new || expect.as_ref().is_some_and(|v| !v.exists());
                 let put = match (method, original_file.is_some()) {
                     (Method::Created, _) if exclusive => Put::NewExclusive,
                     (Method::Created, _) => Put::New,
@@ -397,12 +428,23 @@ impl Pending {
                     (_, false) => Put::OverLink,
                 };
                 match sys::replace(file, &staged, &target.file, put, sync) {
-                    Ok(stamp) => {
+                    Ok(stamp) => stamp,
+                    Err(ReplaceError {
+                        error,
+                        stranded: Some(old),
+                        ..
+                    }) => {
                         cleanup.disarm();
-                        stamp
+                        return Err(Error::Stranded {
+                            path: target.file,
+                            old,
+                            new: staged,
+                            source: error,
+                        });
                     }
-                    Err((e, _))
-                        if put == Put::NewExclusive && e.kind() == io::ErrorKind::AlreadyExists =>
+                    Err(ReplaceError { error, .. })
+                        if put == Put::NewExclusive
+                            && error.kind() == io::ErrorKind::AlreadyExists =>
                     {
                         let path = target.file;
                         return Err(if create_new {
@@ -411,41 +453,26 @@ impl Pending {
                             Error::Conflict { path }
                         });
                     }
-                    Err((e, file))
+                    Err(ReplaceError { error, file, .. })
                         if put == Put::OverFile
                             && strategy == Strategy::Auto
-                            && sys::rename_refused(&e) =>
+                            && sys::rename_refused(&error) =>
                     {
                         method = Method::Overwrote;
-                        reasons.push(Reason::RenameFailed(e.to_string()));
+                        reasons.push(Reason::RenameFailed(error.to_string()));
                         let mut file = match file {
                             Some(file) => file,
                             None => {
                                 File::open(&staged).map_err(|e| Error::io("reopen", &staged, e))?
                             }
                         };
-                        overwrite(
-                            &mut file,
-                            &staged,
-                            &target.file,
-                            contents.len,
-                            sync,
-                            &mut cleanup,
-                        )?
+                        let o = original_file.expect("an OverFile replace has an original");
+                        in_place.run(&mut file, o, &mut cleanup)?
                     }
-                    Err((e, _)) => return Err(Error::io("replace", &target.file, e)),
+                    Err(ReplaceError { error, .. }) => {
+                        return Err(Error::io("replace", &target.file, error))
+                    }
                 }
-            }
-            Method::Overwrote => {
-                let mut file = file;
-                overwrite(
-                    &mut file,
-                    &staged,
-                    &target.file,
-                    contents.len,
-                    sync,
-                    &mut cleanup,
-                )?
             }
         };
 
@@ -465,32 +492,54 @@ impl Pending {
     }
 }
 
-/// Overwrites the target from the staged file. The staged file is closed by the caller, at the
-/// end of its match arm, before `cleanup` deletes it.
-fn overwrite(
-    file: &mut File,
-    staged: &Path,
-    target: &Path,
+/// Overwriting the target in place from the staged file.
+struct Overwrite<'a> {
+    staged: &'a Path,
+    target: &'a Path,
     len: u64,
     sync: bool,
-    cleanup: &mut Cleanup,
-) -> Result<version::Stamp> {
-    match sys::overwrite(file, target, len, sync) {
-        Ok(stamp) => Ok(stamp),
-        Err(sys::OverwriteError {
-            touched: false,
-            error,
-        }) => Err(Error::io("write", target, error)),
-        Err(sys::OverwriteError {
-            touched: true,
-            error,
-        }) => {
-            cleanup.disarm();
-            Err(Error::Interrupted {
-                path: target.into(),
-                staged: staged.into(),
-                source: error,
-            })
+    expect: Option<&'a Version>,
+}
+
+impl Overwrite<'_> {
+    /// Opens and locks the target, makes sure it's still the file that was inspected and (with
+    /// `unchanged_since`) still the expected version, then copies the staged contents over it.
+    /// The staged file is closed by the caller, at the end of its match arm, before `cleanup`
+    /// deletes it.
+    fn run(
+        &self,
+        file: &mut File,
+        original: &sys::Original,
+        cleanup: &mut Cleanup,
+    ) -> Result<Stamp> {
+        let mut to = match sys::open_existing(self.target, original) {
+            Ok(Some(to)) => to,
+            Ok(None) => {
+                return Err(Error::Conflict {
+                    path: self.target.into(),
+                })
+            }
+            Err(e) => return Err(Error::io("open", self.target, e)),
+        };
+        // Checked while holding the lock, so another save of the file can't come in between.
+        check_unchanged(self.expect, self.target)?;
+        match sys::overwrite(file, &mut to, self.len, self.sync) {
+            Ok(stamp) => Ok(stamp),
+            Err(sys::OverwriteError {
+                touched: false,
+                error,
+            }) => Err(Error::io("write", self.target, error)),
+            Err(sys::OverwriteError {
+                touched: true,
+                error,
+            }) => {
+                cleanup.disarm();
+                Err(Error::Interrupted {
+                    path: self.target.into(),
+                    staged: self.staged.into(),
+                    source: error,
+                })
+            }
         }
     }
 }
@@ -611,5 +660,12 @@ mod tests {
                 vec![Lost::SetId, Lost::Capabilities]
             );
         }
+    }
+
+    #[test]
+    fn what_was_lost_is_listed_once() {
+        let mut lost = vec![Lost::Owner, Lost::Group];
+        add_lost(&mut lost, [Lost::Owner, Lost::Acl, Lost::Group, Lost::Acl]);
+        assert_eq!(lost, vec![Lost::Owner, Lost::Group, Lost::Acl]);
     }
 }

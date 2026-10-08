@@ -81,8 +81,8 @@ pub enum Lost {
     Group,
     /// The permission bits. Only with [`Strategy::Replace`](crate::Strategy::Replace).
     Permissions,
-    /// The setuid or setgid permission bits, which are cleared when a file's contents change unless
-    /// the writer is root, the same as the kernel does for a write in place.
+    /// The setuid bit, or the setgid bit of a group-executable file. They are cleared whenever the
+    /// contents change, as the kernel does for a write in place.
     SetId,
     /// Linux file capabilities (`security.capability`), which the kernel clears whenever a file's
     /// contents change.
@@ -93,6 +93,10 @@ pub enum Lost {
     SecurityLabel,
     /// The named extended attribute.
     Xattr(String),
+    /// Whatever extended attributes the file had: they couldn't be read (the file wasn't readable,
+    /// or listing them failed), so it isn't known whether there were any. Only with
+    /// [`Strategy::Replace`](crate::Strategy::Replace).
+    UnreadableXattrs,
     /// File flags (`chattr` on Linux, `chflags` on macOS), such as no-dump or no-copy-on-write.
     Flags,
 }
@@ -109,6 +113,9 @@ impl fmt::Display for Lost {
             Lost::Acl => f.write_str("the access control list"),
             Lost::SecurityLabel => f.write_str("the security label"),
             Lost::Xattr(name) => write!(f, "extended attribute {name}"),
+            Lost::UnreadableXattrs => {
+                f.write_str("any extended attributes (they couldn't be read)")
+            }
             Lost::Flags => f.write_str("file flags"),
         }
     }

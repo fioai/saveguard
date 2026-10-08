@@ -2,7 +2,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::{Error, Result};
+use crate::{sys, Error, Result};
 
 /// Linux gives up after 40 links too.
 const MAX_HOPS: usize = 40;
@@ -19,6 +19,9 @@ pub(crate) struct Target {
 /// write, and the directory where its replacement must be made, are at the end of the chain. A
 /// writer that stops after one hop puts its temporary file next to the middle link, which may be
 /// somewhere read-only (a Nix store) or may get the middle link replaced by a plain file.
+///
+/// Following links by hand skips the kernel's own check on links in shared directories like
+/// `/tmp`, so each hop is checked here instead ([`sys::trusted`]).
 pub(crate) fn resolve(path: &Path, follow: bool) -> Result<Target> {
     let mut file = path.to_path_buf();
     if follow {
@@ -29,6 +32,9 @@ pub(crate) fn resolve(path: &Path, follow: bool) -> Result<Target> {
                     hops += 1;
                     if hops > MAX_HOPS {
                         return Err(Error::SymlinkLoop { path: path.into() });
+                    }
+                    if !sys::trusted(&file, &meta) {
+                        return Err(Error::Untrusted { path: file });
                     }
                     let link = fs::read_link(&file)
                         .map_err(|e| Error::io("read the symlink", &file, e))?;

@@ -126,17 +126,28 @@ fn failures_exit_with_1_and_say_why() {
 /// system doesn't allow that (some distributions and CI runners turn it off).
 #[cfg(target_os = "linux")]
 fn in_namespace(dir: &std::path::Path, script: &str) -> Option<Output> {
+    in_namespace_with(&["-rm"], dir, script)
+}
+
+/// The same with other `unshare` options, such as `--map-auto` for more users than one.
+#[cfg(target_os = "linux")]
+fn in_namespace_with(options: &[&str], dir: &std::path::Path, script: &str) -> Option<Output> {
     let works = Command::new("unshare")
-        .args(["-rm", "true"])
+        .args(options)
+        .arg("true")
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|s| s.success());
     if !works {
-        eprintln!("skipped: unprivileged user namespaces aren't available");
+        eprintln!(
+            "skipped: `unshare {}` isn't available here",
+            options.join(" ")
+        );
         return None;
     }
     let out = Command::new("unshare")
-        .args(["-rm", "sh", "-c", script])
+        .args(options)
+        .args(["sh", "-c", script])
         .env("BIN", BIN)
         .current_dir(dir)
         .output()
@@ -221,6 +232,48 @@ fn a_full_disk_leaves_the_file_as_it_was() {
     );
     assert!(
         text(&out.stderr).contains("No space left on device"),
+        "{}",
+        text(&out.stderr)
+    );
+}
+
+/// In a directory like /tmp, another user can leave a symlink pointing at one of your files and
+/// wait for you to save through it. The kernel refuses to follow such a link
+/// (`fs.protected_symlinks`), and since saveguard follows links itself, it must refuse too; the
+/// same goes for writing to a file another user left there (`fs.protected_regular`).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_link_planted_in_a_shared_directory_is_not_followed() {
+    let dir = TempDir::new();
+    let script = r#"
+        set -e
+        mkdir shared victim
+        chmod 1777 shared
+        printf 'precious\n' > victim/precious.txt
+        ln -s "$PWD/victim/precious.txt" shared/report.txt
+        ln -s "$PWD/victim/planted.txt" shared/new.txt
+        printf 'theirs\n' > shared/theirs.txt
+        chmod 666 shared/theirs.txt
+        chown -h 1:1 shared/report.txt shared/new.txt shared/theirs.txt
+        if printf 'clobbered\n' | "$BIN" write shared/report.txt 2>>err; then echo 'link: followed'; else echo 'link: refused'; fi
+        if printf 'planted\n' | "$BIN" write --new shared/new.txt 2>>err; then echo 'new: created'; else echo 'new: refused'; fi
+        if printf 'mine\n' | "$BIN" write shared/theirs.txt 2>>err; then echo 'file: written'; else echo 'file: refused'; fi
+        cat victim/precious.txt shared/theirs.txt
+        ls victim
+        cat err >&2
+    "#;
+    let Some(out) = in_namespace_with(&["--map-auto", "--map-root-user"], &dir.0, script) else {
+        return;
+    };
+    assert_eq!(
+        text(&out.stdout),
+        "link: refused\nnew: refused\nfile: refused\nprecious\ntheirs\nprecious.txt\n",
+        "stderr: {}",
+        text(&out.stderr)
+    );
+    assert!(
+        text(&out.stderr)
+            .contains("is in a sticky, world-writable directory and belongs to another user"),
         "{}",
         text(&out.stderr)
     );

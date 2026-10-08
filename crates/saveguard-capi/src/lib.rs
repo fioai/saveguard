@@ -38,6 +38,7 @@ const ERR_READ_ONLY: c_int = -5;
 const ERR_SYMLINK_LOOP: c_int = -6;
 const ERR_INTERRUPTED: c_int = -7;
 const ERR_INVALID: c_int = -8;
+const ERR_UNTRUSTED: c_int = -9;
 
 const NO_FOLLOW: u32 = 0x1;
 const NO_SYNC: u32 = 0x2;
@@ -50,7 +51,7 @@ thread_local! {
 /// Records a failure for `saveguard_last_error` and returns its code.
 fn fail(code: c_int, message: impl Into<String>, os_error: c_int) -> c_int {
     let message = CString::new(message.into().replace('\0', "")).unwrap_or_default();
-    LAST.with(|last| *last.borrow_mut() = (message, os_error));
+    let _ = LAST.try_with(|last| *last.borrow_mut() = (message, os_error));
     code
 }
 
@@ -61,13 +62,14 @@ fn fail_with(e: &Error) -> c_int {
         Error::NotAFile { .. } => ERR_NOT_A_FILE,
         Error::ReadOnly { .. } => ERR_READ_ONLY,
         Error::SymlinkLoop { .. } => ERR_SYMLINK_LOOP,
-        Error::Interrupted { .. } => ERR_INTERRUPTED,
+        Error::Untrusted { .. } => ERR_UNTRUSTED,
+        Error::Interrupted { .. } | Error::Stranded { .. } => ERR_INTERRUPTED,
         _ => ERR_IO,
     };
     let os_error = match e {
-        Error::Io { source, .. } | Error::Interrupted { source, .. } => {
-            source.raw_os_error().unwrap_or(0)
-        }
+        Error::Io { source, .. }
+        | Error::Interrupted { source, .. }
+        | Error::Stranded { source, .. } => source.raw_os_error().unwrap_or(0),
         _ => 0,
     };
     fail(code, e.to_string(), os_error)
@@ -170,6 +172,7 @@ fn lost_bits(lost: &[Lost]) -> u32 {
             Lost::Acl => 0x040,
             Lost::SecurityLabel => 0x080,
             Lost::Flags => 0x200,
+            Lost::UnreadableXattrs => 0x400,
             _ => 0x100,
         }
     })
@@ -336,12 +339,14 @@ pub unsafe extern "C" fn saveguard_version_of(
     })
 }
 
+/// Safe to call at any time, including while the thread is being torn down, when it returns "".
 #[no_mangle]
 pub extern "C" fn saveguard_last_error() -> *const c_char {
-    LAST.with(|last| last.borrow().0.as_ptr())
+    LAST.try_with(|last| last.borrow().0.as_ptr())
+        .unwrap_or(c"".as_ptr())
 }
 
 #[no_mangle]
 pub extern "C" fn saveguard_last_os_error() -> c_int {
-    LAST.with(|last| last.borrow().1)
+    LAST.try_with(|last| last.borrow().1).unwrap_or(0)
 }

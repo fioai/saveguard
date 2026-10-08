@@ -26,8 +26,9 @@ pub enum Durability {
     /// returning (`fsync`, and `F_FULLFSYNC` on macOS). The default.
     #[default]
     Full,
-    /// Don't flush. Saves are still atomic for other processes, but a power cut or a kernel crash
-    /// soon after can lose them.
+    /// Don't flush. Saves are still atomic for other processes, but after a power cut or a kernel
+    /// crash soon after, the file can hold the old contents, the new ones, or on some file systems
+    /// nothing at all.
     None,
 }
 
@@ -91,14 +92,17 @@ impl Options {
     /// written when that happens.
     ///
     /// The check is made once before anything is written and again just before the new contents
-    /// are put in place.
+    /// are put in place; for an overwrite in place, while holding a lock that other saveguard saves
+    /// of the file wait for. A replacement can still race another process between that check and
+    /// its rename.
     pub fn unchanged_since(&mut self, version: &Version) -> &mut Options {
         self.expect = Some(version.clone());
         self
     }
 
     /// Fail with [`Error::Exists`] if the file already exists, including if another process creates
-    /// it while this save is being written. Where the file system allows it, the file is created
+    /// it while this save is being written, and if the path is a symlink (even one to a file that
+    /// doesn't exist), as with `O_EXCL`. Where the file system allows it, the file is created
     /// atomically: it never appears half written and is never replaced.
     pub fn create_new(&mut self, create_new: bool) -> &mut Options {
         self.create_new = create_new;

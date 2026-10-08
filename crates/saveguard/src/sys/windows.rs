@@ -7,22 +7,30 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Seek, SeekFrom};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::OpenOptionsExt;
-use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle};
 use std::path::Path;
+use std::ptr;
 use std::thread;
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{
-    GetLastError, ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION,
-    ERROR_UNABLE_TO_MOVE_REPLACEMENT_2, ERROR_UNABLE_TO_REMOVE_REPLACED,
+    GetLastError, LocalFree, ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION,
+    ERROR_UNABLE_TO_MOVE_REPLACEMENT_2, ERROR_UNABLE_TO_REMOVE_REPLACED, GENERIC_READ,
+    GENERIC_WRITE, INVALID_HANDLE_VALUE,
 };
+use windows_sys::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+};
+use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows_sys::Win32::Storage::FileSystem::{
-    GetFileInformationByHandle, MoveFileExW, ReplaceFileW, BY_HANDLE_FILE_INFORMATION,
-    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    CreateFileW, GetFileInformationByHandle, LockFileEx, MoveFileExW, ReplaceFileW,
+    BY_HANDLE_FILE_INFORMATION, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_READ_ATTRIBUTES,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, LOCKFILE_EXCLUSIVE_LOCK,
     MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
 };
+use windows_sys::Win32::System::IO::{OVERLAPPED, OVERLAPPED_0, OVERLAPPED_0_0};
 
-use super::{Facts, Failure, OverwriteError, Put, Staged};
+use super::{Facts, Failure, OverwriteError, Put, ReplaceError, Staged};
 use crate::version::Stamp;
 
 /// The file being saved over, as it was when the save started.
@@ -59,6 +67,15 @@ impl Original {
             capabilities: false,
         }
     }
+
+    /// Windows has no sticky, world-writable directories to distrust.
+    pub fn trusted(&self, _path: &Path) -> bool {
+        true
+    }
+}
+
+pub(crate) fn trusted(_path: &Path, _meta: &fs::Metadata) -> bool {
+    true
 }
 
 pub(crate) fn inspect(path: &Path) -> io::Result<Option<Original>> {
@@ -119,16 +136,26 @@ pub(crate) fn dir_writable(_dir: &Path) -> bool {
     true
 }
 
-pub(crate) fn create_staged(dir: &Path, _mode: u32) -> io::Result<Staged> {
+/// A new, empty file in `dir`. With `mode` `None` (contents that will replace an existing file)
+/// only its owner can open it; `ReplaceFileW` gives it the original's ACL at the end. Otherwise it
+/// gets the directory's inherited ACL, like any new file.
+pub(crate) fn create_staged(
+    dir: &Path,
+    name: Option<&OsStr>,
+    mode: Option<u32>,
+) -> io::Result<Staged> {
     let mut collisions = 0;
     loop {
-        let path = dir.join(super::temp_name());
-        match OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
+        let path = dir.join(super::temp_name(name));
+        let created = match mode {
+            Some(_) => OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path),
+            None => create_private(&path),
+        };
+        match created {
             Ok(file) => return Ok(Staged { file, path }),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists && collisions < 100 => {
                 collisions += 1
@@ -136,6 +163,47 @@ pub(crate) fn create_staged(dir: &Path, _mode: u32) -> io::Result<Staged> {
             Err(e) => return Err(e),
         }
     }
+}
+
+/// Creates a file with a DACL that gives its owner everything and inherits nothing from the
+/// directory: "D:P(A;;FA;;;OW)", protected, one entry, all access for OWNER RIGHTS.
+fn create_private(path: &Path) -> io::Result<File> {
+    let sddl: Vec<u16> = "D:P(A;;FA;;;OW)".encode_utf16().chain(Some(0)).collect();
+    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    let converted = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            ptr::null_mut(),
+        )
+    };
+    if converted == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor,
+        bInheritHandle: 0,
+    };
+    let handle = unsafe {
+        CreateFileW(
+            wide(path).as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            &attributes,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            ptr::null_mut(),
+        )
+    };
+    let error = io::Error::last_os_error();
+    unsafe { LocalFree(descriptor) };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(error);
+    }
+    // SAFETY: a handle CreateFileW just opened, owned by nothing else.
+    Ok(unsafe { File::from_raw_handle(handle) })
 }
 
 pub(crate) fn prepare(_staged: &File, _original: &Original, _failures: &mut Vec<Failure>) {}
@@ -151,22 +219,23 @@ pub(crate) fn replace(
     target: &Path,
     put: Put,
     sync: bool,
-) -> Result<Stamp, (io::Error, Option<File>)> {
+) -> Result<Stamp, ReplaceError> {
     let before = match stamp_of(&file) {
         Ok(stamp) => stamp,
-        Err(e) => return Err((e, Some(file))),
+        Err(e) => return Err(ReplaceError::new(e, Some(file))),
     };
     // ReplaceFileW opens the staged file without sharing, so it must be closed first.
     drop(file);
-    let done = match put {
-        Put::New | Put::OverLink => move_file(staged, target, true, sync),
-        Put::NewExclusive => move_file(staged, target, false, sync),
-        Put::OverFile => replace_file(staged, target),
-    };
-    match done {
-        Ok(()) => Ok(stamp_at(target).ok().flatten().unwrap_or(before)),
-        Err(e) => Err((e, None)),
+    match put {
+        Put::New | Put::OverLink => {
+            move_file(staged, target, true, sync).map_err(|e| ReplaceError::new(e, None))?
+        }
+        Put::NewExclusive => {
+            move_file(staged, target, false, sync).map_err(|e| ReplaceError::new(e, None))?
+        }
+        Put::OverFile => replace_file(staged, target, sync)?,
     }
+    Ok(stamp_at(target).ok().flatten().unwrap_or(before))
 }
 
 fn move_file(from: &Path, to: &Path, replace: bool, sync: bool) -> io::Result<()> {
@@ -187,8 +256,8 @@ fn move_file(from: &Path, to: &Path, replace: bool, sync: bool) -> io::Result<()
 /// `ReplaceFileW`, with the error cases its documentation describes. The old file is moved to a
 /// backup name rather than deleted, because if the last step fails without one, the documentation
 /// can't say where the old file went.
-fn replace_file(staged: &Path, target: &Path) -> io::Result<()> {
-    let backup = target.with_file_name(super::temp_name());
+fn replace_file(staged: &Path, target: &Path, sync: bool) -> Result<(), ReplaceError> {
+    let backup = target.with_file_name(super::temp_name(target.file_name()));
     let (t, s, b) = (wide(target), wide(staged), wide(&backup));
     let mut delay = Duration::from_millis(1);
     loop {
@@ -198,12 +267,12 @@ fn replace_file(staged: &Path, target: &Path) -> io::Result<()> {
                 s.as_ptr(),
                 b.as_ptr(),
                 0,
-                std::ptr::null(),
-                std::ptr::null(),
+                ptr::null(),
+                ptr::null(),
             )
         };
         if ok != 0 {
-            let _ = fs::remove_file(&backup);
+            finish(target, &backup, sync);
             return Ok(());
         }
         let code = unsafe { GetLastError() };
@@ -219,21 +288,54 @@ fn replace_file(staged: &Path, target: &Path) -> io::Result<()> {
                 thread::sleep(delay);
                 delay *= 2;
             }
-            // The old file is now at `backup` and the new one is still staged.
+            // The old file is now at `backup` and the new one is still staged. Move the new one
+            // into place, or else the old one back; if neither works, say where both are.
             ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 => {
-                return match move_file(staged, target, false, true) {
+                let error = match move_file(staged, target, false, true) {
                     Ok(()) => {
-                        let _ = fs::remove_file(&backup);
-                        Ok(())
+                        finish(target, &backup, sync);
+                        return Ok(());
                     }
-                    Err(e) => {
-                        let _ = move_file(&backup, target, false, true);
-                        Err(e)
-                    }
+                    Err(e) => e,
                 };
+                return Err(match move_file(&backup, target, false, true) {
+                    Ok(()) => ReplaceError::new(error, None),
+                    Err(_) => ReplaceError {
+                        error,
+                        file: None,
+                        stranded: Some(backup),
+                    },
+                });
             }
             // Including ERROR_UNABLE_TO_MOVE_REPLACEMENT: with a backup name, nothing moved.
-            _ => return Err(io::Error::from_raw_os_error(code as i32)),
+            _ => {
+                return Err(ReplaceError::new(
+                    io::Error::from_raw_os_error(code as i32),
+                    None,
+                ))
+            }
+        }
+    }
+}
+
+/// After a replace: flush the file (`ReplaceFileW` has no write-through option, so this is the
+/// best that can be done), and delete the old file, waiting a little for anything holding it.
+fn finish(target: &Path, backup: &Path, sync: bool) {
+    if sync {
+        if let Ok(file) = OpenOptions::new().write(true).open(target) {
+            let _ = file.sync_all();
+        }
+    }
+    let mut delay = Duration::from_millis(1);
+    loop {
+        match fs::remove_file(backup) {
+            Ok(()) => return,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return,
+            Err(_) if delay < Duration::from_millis(500) => {
+                thread::sleep(delay);
+                delay *= 2;
+            }
+            Err(_) => return,
         }
     }
 }
@@ -245,10 +347,45 @@ pub(crate) fn rename_refused(e: &io::Error) -> bool {
     e.kind() != io::ErrorKind::NotFound
 }
 
-/// Copies the staged contents, from the start of `from`, into the existing file at `target`.
+/// Opens the file to be overwritten, if it's still the file inspected when the save began, and
+/// locks it so that two saveguard saves overwriting it take turns. The lock is on one byte far
+/// past the end: Windows locks are mandatory, and locking the contents would make other programs'
+/// reads fail.
+pub(crate) fn open_existing(target: &Path, original: &Original) -> io::Result<Option<File>> {
+    let file = OpenOptions::new().write(true).open(target)?;
+    if let Some(expected) = original.info {
+        let now = info(&file)?;
+        if now.volume != expected.volume || now.index != expected.index {
+            return Ok(None);
+        }
+    }
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    overlapped.Anonymous = OVERLAPPED_0 {
+        Anonymous: OVERLAPPED_0_0 {
+            Offset: 0xFFFF_FFFE,
+            OffsetHigh: 0x7FFF_FFFF,
+        },
+    };
+    // Without LOCKFILE_FAIL_IMMEDIATELY this waits for the lock. A file system that can't lock
+    // fails it, and then the save carries on without.
+    unsafe {
+        LockFileEx(
+            file.as_raw_handle(),
+            LOCKFILE_EXCLUSIVE_LOCK,
+            0,
+            1,
+            0,
+            &mut overlapped,
+        )
+    };
+    Ok(Some(file))
+}
+
+/// Copies the staged contents, from the start of `from`, into `to`, the file from
+/// [`open_existing`].
 pub(crate) fn overwrite(
     from: &mut File,
-    target: &Path,
+    to: &mut File,
     len: u64,
     sync: bool,
 ) -> Result<Stamp, OverwriteError> {
@@ -261,16 +398,13 @@ pub(crate) fn overwrite(
         error,
     };
     from.seek(SeekFrom::Start(0)).map_err(before)?;
-    let mut to = OpenOptions::new()
-        .write(true)
-        .open(target)
-        .map_err(before)?;
-    io::copy(from, &mut to).map_err(after)?;
+    to.seek(SeekFrom::Start(0)).map_err(before)?;
+    io::copy(from, to).map_err(after)?;
     to.set_len(len).map_err(after)?;
     if sync {
         to.sync_all().map_err(after)?;
     }
-    stamp_of(&to).map_err(after)
+    stamp_of(to).map_err(after)
 }
 
 pub(crate) fn stamp_of(file: &File) -> io::Result<Stamp> {

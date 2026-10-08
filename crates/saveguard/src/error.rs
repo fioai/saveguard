@@ -22,12 +22,26 @@ pub enum Error {
     ReadOnly { path: PathBuf },
     /// Following the path's symlinks went round more than 40 times.
     SymlinkLoop { path: PathBuf },
+    /// The path leads through a symlink, or to a file, in a sticky, world-writable directory such as
+    /// `/tmp` that belongs to another user (neither this one nor the directory's owner). Writing
+    /// through it would let that user choose what gets overwritten, so the kernel refuses to as
+    /// well (`fs.protected_symlinks`, `fs.protected_regular`).
+    Untrusted { path: PathBuf },
     /// Overwriting the file in place failed partway, so it may now hold part of the new contents.
     /// The complete new contents are in the file at `staged`, which was kept so they can be
     /// recovered.
     Interrupted {
         path: PathBuf,
         staged: PathBuf,
+        source: io::Error,
+    },
+    /// Replacing the file failed partway and couldn't be undone (Windows only, when `ReplaceFileW`
+    /// fails at its last step and the old file can't be moved back). There may be no file at `path`:
+    /// the old contents are at `old` and the new ones at `new`.
+    Stranded {
+        path: PathBuf,
+        old: PathBuf,
+        new: PathBuf,
         source: io::Error,
     },
     /// Any other I/O failure: what was being done, to which path, and the error.
@@ -55,7 +69,9 @@ impl Error {
             | Error::NotAFile { path }
             | Error::ReadOnly { path }
             | Error::SymlinkLoop { path }
+            | Error::Untrusted { path }
             | Error::Interrupted { path, .. }
+            | Error::Stranded { path, .. }
             | Error::Io { path, .. } => path,
         }
     }
@@ -66,8 +82,10 @@ impl Error {
             Error::Conflict { .. } | Error::SymlinkLoop { .. } => io::ErrorKind::Other,
             Error::Exists { .. } => io::ErrorKind::AlreadyExists,
             Error::NotAFile { .. } => io::ErrorKind::InvalidInput,
-            Error::ReadOnly { .. } => io::ErrorKind::PermissionDenied,
-            Error::Interrupted { source, .. } | Error::Io { source, .. } => source.kind(),
+            Error::ReadOnly { .. } | Error::Untrusted { .. } => io::ErrorKind::PermissionDenied,
+            Error::Interrupted { source, .. }
+            | Error::Stranded { source, .. }
+            | Error::Io { source, .. } => source.kind(),
         }
     }
 }
@@ -84,6 +102,23 @@ impl fmt::Display for Error {
             Error::SymlinkLoop { path } => {
                 write!(f, "too many levels of symbolic links at {}", path.display())
             }
+            Error::Untrusted { path } => write!(
+                f,
+                "{} is in a sticky, world-writable directory and belongs to another user, so it isn't followed or written",
+                path.display()
+            ),
+            Error::Stranded {
+                path,
+                old,
+                new,
+                source,
+            } => write!(
+                f,
+                "replacing {} failed partway ({source}); the old contents are in {} and the new ones in {}",
+                path.display(),
+                old.display(),
+                new.display()
+            ),
             Error::Interrupted {
                 path,
                 staged,
@@ -106,7 +141,9 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Error::Interrupted { source, .. } | Error::Io { source, .. } => Some(source),
+            Error::Interrupted { source, .. }
+            | Error::Stranded { source, .. }
+            | Error::Io { source, .. } => Some(source),
             _ => None,
         }
     }

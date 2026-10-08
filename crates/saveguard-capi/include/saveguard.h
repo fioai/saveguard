@@ -35,7 +35,8 @@ typedef struct saveguard_version {
 /* saveguard_options.flags */
 #define SAVEGUARD_NO_FOLLOW 0x1u  /* replace a symlink itself, not the file it points to */
 #define SAVEGUARD_NO_SYNC 0x2u    /* don't wait for the disk */
-#define SAVEGUARD_CREATE_NEW 0x4u /* fail with SAVEGUARD_ERR_EXISTS if the file exists */
+#define SAVEGUARD_CREATE_NEW 0x4u /* fail with SAVEGUARD_ERR_EXISTS if the file (or a symlink)
+                                     is there */
 
 typedef struct saveguard_options {
     uint32_t strategy;
@@ -72,6 +73,7 @@ typedef struct saveguard_options {
 #define SAVEGUARD_LOST_SECURITY_LABEL 0x080u
 #define SAVEGUARD_LOST_XATTR 0x100u
 #define SAVEGUARD_LOST_FLAGS 0x200u
+#define SAVEGUARD_LOST_UNREADABLE_XATTRS 0x400u /* any it had: they couldn't be read */
 
 typedef struct saveguard_report {
     uint32_t method;
@@ -89,8 +91,11 @@ typedef struct saveguard_report {
 #define SAVEGUARD_ERR_NOT_A_FILE (-4)   /* a directory, device, ... */
 #define SAVEGUARD_ERR_READ_ONLY (-5)    /* the file can't be written by this process */
 #define SAVEGUARD_ERR_SYMLINK_LOOP (-6)
-#define SAVEGUARD_ERR_INTERRUPTED (-7)  /* overwriting failed partway: see saveguard_last_error() */
+#define SAVEGUARD_ERR_INTERRUPTED (-7)  /* failed partway: saveguard_last_error() says where the
+                                           complete contents are */
 #define SAVEGUARD_ERR_INVALID (-8)      /* a bad argument */
+#define SAVEGUARD_ERR_UNTRUSTED (-9)    /* through a symlink or to a file that another user put in a
+                                           sticky, world-writable directory such as /tmp */
 
 /* Saves len bytes from data to the file at path. options and report may be NULL. */
 int saveguard_save(const char *path, const void *data, size_t len,

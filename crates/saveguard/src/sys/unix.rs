@@ -1,7 +1,7 @@
 //! Linux, macOS and other Unix systems. Extended attributes and file flags are handled on Linux
 //! and Apple systems; the rest works on any Unix.
 
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsStr};
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Seek, SeekFrom};
 use std::os::unix::ffi::OsStrExt;
@@ -9,7 +9,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
-use super::{Facts, Failure, OverwriteError, Put, Staged};
+use super::{Facts, Failure, OverwriteError, Put, ReplaceError, Staged};
 use crate::version::Stamp;
 use crate::Lost;
 
@@ -38,11 +38,33 @@ impl Original {
             links: self.meta.nlink(),
             mount_point: self.mount_point,
             owner_kept: root || self.meta.uid() == unsafe { libc::geteuid() },
-            group_kept: root || in_group(self.meta.gid()),
-            setid: kept_mode(mode) != mode,
+            // When it can't be told, try: copying the group fails if it can't be done.
+            group_kept: root || in_group(self.meta.gid()) != Some(false),
+            setid: kept_mode(mode, self.meta.gid()) != mode,
             capabilities: has_capabilities(self.file.as_ref()),
         }
     }
+
+    /// See [`trusted`].
+    pub fn trusted(&self, path: &Path) -> bool {
+        trusted(path, &self.meta)
+    }
+}
+
+/// The kernel's rule for sticky, world-writable directories such as `/tmp`
+/// (`fs.protected_symlinks`, `fs.protected_regular`): a symlink or file in one may only be
+/// followed or written by its owner, or if it belongs to the directory's owner. Otherwise another
+/// user could plant a link there and choose what a save overwrites. Following symlinks by hand, as
+/// `resolve` does, skips the kernel's check, so it's made here, on every Unix.
+pub(crate) fn trusted(path: &Path, meta: &Metadata) -> bool {
+    let Ok(dir) = fs::metadata(dir_of(path)) else {
+        return true; // nothing to go on; the save itself will fail
+    };
+    let mode = dir.mode();
+    if mode & STICKY == 0 || mode & OTHERS_WRITE == 0 {
+        return true;
+    }
+    meta.uid() == unsafe { libc::geteuid() } || meta.uid() == dir.uid()
 }
 
 pub(crate) fn inspect(path: &Path) -> io::Result<Option<Original>> {
@@ -58,9 +80,10 @@ pub(crate) fn inspect(path: &Path) -> io::Result<Option<Original>> {
             mount_point: false,
         }));
     }
+    // Non-blocking, in case a FIFO is swapped in after the look: opening one would wait forever.
     let file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .ok();
     // Prefer what the open file says, so the metadata and the handle are the same file.
@@ -80,31 +103,71 @@ fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
-fn in_group(gid: u32) -> bool {
+/// Whether this process is in the group: `None` when it can't be told, because macOS's
+/// `getgroups` stops at 16 groups.
+fn in_group(gid: u32) -> Option<bool> {
     if unsafe { libc::getegid() } == gid {
-        return true;
+        return Some(true);
     }
     let n = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
-    if n <= 0 {
-        return false;
+    if n < 0 {
+        return None;
     }
-    let mut groups = vec![0 as libc::gid_t; n as usize];
+    let mut groups = vec![0 as libc::gid_t; n.max(1) as usize];
     let n = unsafe { libc::getgroups(n, groups.as_mut_ptr()) };
-    n > 0 && groups[..n as usize].contains(&gid)
+    if n < 0 {
+        return None;
+    }
+    let found = groups[..n as usize].contains(&gid);
+    if !found && cfg!(target_vendor = "apple") && n >= 16 {
+        return None;
+    }
+    Some(found)
 }
 
-/// The permissions a file keeps when its contents change: setuid, and setgid on a group-executable
-/// file, are cleared unless the writer is root. That's what the kernel does for a write in place,
-/// so a replacement does the same rather than carrying privileges over to contents nobody vetted.
-fn kept_mode(mode: u32) -> u32 {
-    let mut mode = mode & 0o7777;
-    if !is_root() {
-        mode &= !SETUID;
-        if mode & GROUP_EXEC != 0 {
-            mode &= !SETGID;
-        }
+/// The permissions a file keeps when its contents change, by the kernel's rule for a write in place
+/// (`setattr_should_drop_suidgid` in Linux's `fs/attr.c`): unless the writer may keep them, setuid
+/// is cleared, and setgid too if the file is group-executable or the writer isn't in its group. A
+/// replacement does the same rather than carry privileges over to contents nobody vetted.
+fn kept_mode(mode: u32, gid: u32) -> u32 {
+    let mode = mode & 0o7777;
+    if mode & (SETUID | SETGID) == 0 || retains_setid() {
+        return mode;
     }
-    mode
+    let mut kept = mode & !SETUID;
+    if kept & SETGID != 0 && (kept & GROUP_EXEC != 0 || in_group(gid) == Some(false)) {
+        kept &= !SETGID;
+    }
+    kept
+}
+
+/// Linux keeps the bits when the writer has `CAP_FSETID` in the *initial* user namespace
+/// (`capable()`): root in a container's own user namespace doesn't count.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn retains_setid() -> bool {
+    const CAP_FSETID: u32 = 4;
+    // PROC_USER_INIT_INO: the initial user namespace's inode number, fixed in the kernel.
+    const INIT_USER_NS: u64 = 0xEFFF_FFFD;
+    let Ok(ns) = fs::metadata("/proc/self/ns/user") else {
+        return is_root();
+    };
+    if ns.ino() != INIT_USER_NS {
+        return false;
+    }
+    let Ok(status) = fs::read_to_string("/proc/self/status") else {
+        return is_root();
+    };
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:"))
+        .and_then(|caps| u64::from_str_radix(caps.trim(), 16).ok())
+        .map_or_else(is_root, |caps| caps & (1 << CAP_FSETID) != 0)
+}
+
+/// Elsewhere, root keeps them.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn retains_setid() -> bool {
+    is_root()
 }
 
 // mode_t is 16 bits on macOS and 32 elsewhere.
@@ -114,6 +177,10 @@ const SETUID: u32 = libc::S_ISUID as u32;
 const SETGID: u32 = libc::S_ISGID as u32;
 #[allow(clippy::unnecessary_cast)]
 const GROUP_EXEC: u32 = libc::S_IXGRP as u32;
+#[allow(clippy::unnecessary_cast)]
+const STICKY: u32 = libc::S_ISVTX as u32;
+#[allow(clippy::unnecessary_cast)]
+const OTHERS_WRITE: u32 = libc::S_IWOTH as u32;
 
 /// Whether the file is itself a mount point, like a single file bind-mounted into a container.
 ///
@@ -204,15 +271,21 @@ pub(crate) fn dir_writable(dir: &Path) -> bool {
     access(dir, libc::W_OK | libc::X_OK).is_ok()
 }
 
-pub(crate) fn create_staged(dir: &Path, mode: u32) -> io::Result<Staged> {
+/// A new, empty file in `dir`: with `mode` (less the umask), or private to this user (`0600`) when
+/// `mode` is `None`.
+pub(crate) fn create_staged(
+    dir: &Path,
+    name: Option<&OsStr>,
+    mode: Option<u32>,
+) -> io::Result<Staged> {
     let mut collisions = 0;
     loop {
-        let path = dir.join(super::temp_name());
+        let path = dir.join(super::temp_name(name));
         match OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
-            .mode(mode)
+            .mode(mode.unwrap_or(0o600))
             .open(&path)
         {
             Ok(file) => return Ok(Staged { file, path }),
@@ -241,7 +314,7 @@ pub(crate) fn copy_metadata(staged: &File, original: &Original, failures: &mut V
     match &original.file {
         Some(from) => copy_xattrs(from, staged, failures),
         None => failures.push(Failure {
-            lost: None,
+            lost: Lost::UnreadableXattrs,
             detail: "its extended attributes: the file can't be opened for reading".into(),
         }),
     }
@@ -265,7 +338,7 @@ fn copy_owner(staged: &File, meta: &Metadata, failures: &mut Vec<Failure>) {
         Ok(now) => now,
         Err(e) => {
             failures.push(Failure {
-                lost: Some(Lost::Owner),
+                lost: Lost::Owner,
                 detail: format!("the owner: {e}"),
             });
             return;
@@ -282,14 +355,14 @@ fn copy_owner(staged: &File, meta: &Metadata, failures: &mut Vec<Failure>) {
     let e = io::Error::last_os_error();
     if now.uid() != uid {
         failures.push(Failure {
-            lost: Some(Lost::Owner),
+            lost: Lost::Owner,
             detail: format!("the owner: {e}"),
         });
     }
     // The group may still be possible alone (-1 leaves the owner as it is).
     if now.gid() != gid && unsafe { libc::fchown(fd, libc::uid_t::MAX, gid) } != 0 {
         failures.push(Failure {
-            lost: Some(Lost::Group),
+            lost: Lost::Group,
             detail: format!("the group: {}", io::Error::last_os_error()),
         });
     }
@@ -297,7 +370,7 @@ fn copy_owner(staged: &File, meta: &Metadata, failures: &mut Vec<Failure>) {
 
 /// After the owner: changing the owner clears setuid and setgid.
 fn copy_mode(staged: &File, meta: &Metadata, failures: &mut Vec<Failure>) {
-    let mode = kept_mode(meta.mode());
+    let mode = kept_mode(meta.mode(), meta.gid());
     if staged
         .metadata()
         .is_ok_and(|now| now.mode() & 0o7777 == mode)
@@ -306,7 +379,7 @@ fn copy_mode(staged: &File, meta: &Metadata, failures: &mut Vec<Failure>) {
     }
     if unsafe { libc::fchmod(staged.as_raw_fd(), mode as libc::mode_t) } != 0 {
         failures.push(Failure {
-            lost: Some(Lost::Permissions),
+            lost: Lost::Permissions,
             detail: format!("the permissions: {}", io::Error::last_os_error()),
         });
     }
@@ -319,7 +392,7 @@ fn copy_xattrs(from: &File, to: &File, failures: &mut Vec<Failure>) {
         Ok(names) => names,
         Err(e) => {
             failures.push(Failure {
-                lost: None,
+                lost: Lost::UnreadableXattrs,
                 detail: format!("its extended attributes: {e}"),
             });
             return;
@@ -330,6 +403,9 @@ fn copy_xattrs(from: &File, to: &File, failures: &mut Vec<Failure>) {
             continue;
         }
         match xattr::get(src, name) {
+            // Setting a value it already has (a security label the directory gave it) can still
+            // need permission, so don't.
+            Ok(Some(value)) if xattr::get(dst, name).ok().flatten().as_ref() == Some(&value) => {}
             Ok(Some(value)) => {
                 if let Err(e) = xattr::set(dst, name, &value) {
                     failures.push(xattr_failure(name, &e));
@@ -362,7 +438,7 @@ fn xattr_failure(name: &CStr, e: &io::Error) -> Failure {
         _ => format!("extended attribute {}", name.to_string_lossy()),
     };
     Failure {
-        lost: Some(lost),
+        lost,
         detail: format!("{what}: {e}"),
     }
 }
@@ -393,11 +469,16 @@ fn worth_copying(name: &CStr) -> bool {
     apple::keep_on_save(name)
 }
 
-/// Security labels are the system's to set, and so is the quarantine flag.
-#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+/// Security labels are the system's to set.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn removable(name: &CStr) -> bool {
-    let name = name.to_bytes();
-    !name.starts_with(b"security.") && name != b"com.apple.quarantine"
+    !name.to_bytes().starts_with(b"security.")
+}
+
+/// The system's own attributes (quarantine, provenance, sandbox grants) are the system's to set.
+#[cfg(target_vendor = "apple")]
+fn removable(name: &CStr) -> bool {
+    !name.to_bytes().starts_with(b"com.apple.")
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -419,18 +500,18 @@ pub(crate) fn replace(
     target: &Path,
     put: Put,
     sync: bool,
-) -> Result<Stamp, (io::Error, Option<File>)> {
+) -> Result<Stamp, ReplaceError> {
     // A rename doesn't change the file's own metadata, so this is its version afterwards too.
     let stamp = match stamp_of(&file) {
         Ok(stamp) => stamp,
-        Err(e) => return Err((e, Some(file))),
+        Err(e) => return Err(ReplaceError::new(e, Some(file))),
     };
     let renamed = match put {
         Put::NewExclusive => rename_noreplace(staged, target),
         Put::New | Put::OverFile | Put::OverLink => fs::rename(staged, target),
     };
     if let Err(e) = renamed {
-        return Err((e, Some(file)));
+        return Err(ReplaceError::new(e, Some(file)));
     }
     drop(file);
     if sync {
@@ -508,10 +589,40 @@ pub(crate) fn rename_refused(e: &io::Error) -> bool {
     e.raw_os_error().is_some_and(|c| refusals.contains(&c))
 }
 
-/// Copies the staged contents, from the start of `from`, into the existing file at `target`.
+/// Opens the file to be overwritten, if it's still the file inspected when the save began, and
+/// locks it. `None` if something else is at the path now: a path can be made to lead elsewhere in
+/// between (a directory swapped for a symlink), and the inspection is what the decision rests on.
+/// The lock (`flock`) makes two saveguard saves that overwrite the same file take turns, rather
+/// than interleave their writes; other programs aren't affected.
+pub(crate) fn open_existing(target: &Path, original: &Original) -> io::Result<Option<File>> {
+    let file = OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(target)?;
+    let meta = file.metadata()?;
+    if meta.dev() != original.meta.dev() || meta.ino() != original.meta.ino() {
+        return Ok(None);
+    }
+    let no_locks = [libc::ENOLCK, libc::ENOSYS, libc::EOPNOTSUPP, libc::EINVAL];
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            break;
+        }
+        let e = io::Error::last_os_error();
+        match e.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(c) if no_locks.contains(&c) => break, // no locks here: carry on without
+            _ => return Err(e),
+        }
+    }
+    Ok(Some(file))
+}
+
+/// Copies the staged contents, from the start of `from`, into `to`, the file from
+/// [`open_existing`].
 pub(crate) fn overwrite(
     from: &mut File,
-    target: &Path,
+    to: &mut File,
     len: u64,
     sync: bool,
 ) -> Result<Stamp, OverwriteError> {
@@ -524,18 +635,14 @@ pub(crate) fn overwrite(
         error,
     };
     from.seek(SeekFrom::Start(0)).map_err(before)?;
-    let mut to = OpenOptions::new()
-        .write(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(target)
-        .map_err(before)?;
-    reserve(&to, len).map_err(before)?;
-    io::copy(from, &mut to).map_err(after)?;
+    to.seek(SeekFrom::Start(0)).map_err(before)?;
+    reserve(to, len).map_err(before)?;
+    io::copy(from, to).map_err(after)?;
     to.set_len(len).map_err(after)?;
     if sync {
         to.sync_all().map_err(after)?;
     }
-    stamp_of(&to).map_err(after)
+    stamp_of(to).map_err(after)
 }
 
 /// Makes sure there's room for a file that grows, so that a full disk is found before anything
@@ -755,15 +862,27 @@ mod linux {
     use crate::sys::Failure;
     use crate::Lost;
 
-    // From <linux/fs.h>: the flags a file's owner can set that are worth keeping.
+    // From <linux/fs.h>: the flags worth keeping. Not the ones the file system manages itself
+    // (extents, inline data, encryption, verity), nor immutable and append-only, which stop any
+    // save. Some need privilege to set (data journaling); then Auto overwrites in place.
+    const FS_SECRM_FL: c_int = 0x0000_0001;
+    const FS_UNRM_FL: c_int = 0x0000_0002;
     const FS_COMPR_FL: c_int = 0x0000_0004;
     const FS_SYNC_FL: c_int = 0x0000_0008;
     const FS_NODUMP_FL: c_int = 0x0000_0040;
     const FS_NOATIME_FL: c_int = 0x0000_0080;
     const FS_NOCOMP_FL: c_int = 0x0000_0400;
+    const FS_JOURNAL_DATA_FL: c_int = 0x0000_4000;
     const FS_NOCOW_FL: c_int = 0x0080_0000;
-    const COPIED: c_int =
-        FS_COMPR_FL | FS_SYNC_FL | FS_NODUMP_FL | FS_NOATIME_FL | FS_NOCOMP_FL | FS_NOCOW_FL;
+    const COPIED: c_int = FS_SECRM_FL
+        | FS_UNRM_FL
+        | FS_COMPR_FL
+        | FS_SYNC_FL
+        | FS_NODUMP_FL
+        | FS_NOATIME_FL
+        | FS_NOCOMP_FL
+        | FS_JOURNAL_DATA_FL
+        | FS_NOCOW_FL;
 
     fn get(file: &File) -> io::Result<c_int> {
         let mut flags: c_int = 0;
@@ -808,7 +927,7 @@ mod linux {
 
     fn failure(e: &io::Error) -> Failure {
         Failure {
-            lost: Some(Lost::Flags),
+            lost: Lost::Flags,
             detail: format!("its file flags: {e}"),
         }
     }
@@ -848,7 +967,7 @@ mod apple {
         };
         if r != 0 {
             failures.push(Failure {
-                lost: Some(Lost::Acl),
+                lost: Lost::Acl,
                 detail: format!("the access control list: {}", io::Error::last_os_error()),
             });
         }
@@ -876,7 +995,7 @@ mod apple {
         }
         if unsafe { libc::fchflags(to.as_raw_fd(), (current & !COPIED_FLAGS) | wanted) } != 0 {
             failures.push(Failure {
-                lost: Some(Lost::Flags),
+                lost: Lost::Flags,
                 detail: format!("its file flags: {}", io::Error::last_os_error()),
             });
         }
