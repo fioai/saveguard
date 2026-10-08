@@ -381,10 +381,18 @@ fn match_security(staged: &File, original: &Original) -> Result<(), Failure> {
         lost: Lost::Acl,
         detail: format!("the access control list: {detail}"),
     };
-    let Some(file) = &original.file else {
-        return Err(acl("it can't be read".into()));
-    };
-    let theirs = Security::of(file).map_err(|e| acl(e.to_string()))?;
+    // The file being replaced: through the handle opened when the save began or, when another
+    // save has replaced it since (that handle then reaches a deleted file), whatever is at the
+    // path now, which is what this save will replace.
+    let theirs = original
+        .file
+        .as_ref()
+        .and_then(|file| Security::of(file).ok())
+        .or_else(|| {
+            let file = open_with(&original.path, READ_CONTROL).ok()?;
+            Security::of(&file).ok()
+        })
+        .ok_or_else(|| acl("it can't be read".into()))?;
     let ours = Security::of(staged).map_err(|e| acl(e.to_string()))?;
     if !theirs.same_owner(&ours) {
         return Err(Failure {
@@ -689,5 +697,57 @@ pub(crate) fn stamp_at(path: &Path) -> io::Result<Option<Stamp>> {
         Ok(file) => stamp_of(&file).map(Some),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    /// While other saves keep replacing the file, its ACL can still be matched: a new file in the
+    /// same directory inherits the same one. Prints what went wrong if not.
+    #[test]
+    fn security_matches_while_others_replace_the_file() {
+        let dir = std::env::temp_dir().join(format!("saveguard-unit-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("a.txt");
+        fs::write(&path, "start").unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let others: Vec<_> = (0..3)
+            .map(|_| {
+                let (path, stop) = (path.clone(), Arc::clone(&stop));
+                thread::spawn(move || {
+                    let mut opts = crate::Options::new();
+                    opts.durability(crate::Durability::None)
+                        .strategy(crate::Strategy::Replace);
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = opts.save(&path, "x");
+                    }
+                })
+            })
+            .collect();
+        let mut failures = Vec::new();
+        for _ in 0..300 {
+            let Ok(Some(original)) = inspect(&path) else {
+                continue;
+            };
+            let staged = create_staged(&dir, None, Stage::Replacement).unwrap();
+            if let Err(failure) = match_security(&staged.file, &original) {
+                failures.push(failure.detail);
+            }
+            drop(staged.file);
+            let _ = fs::remove_file(&staged.path);
+        }
+        stop.store(true, Ordering::Relaxed);
+        for t in others {
+            t.join().unwrap();
+        }
+        let _ = fs::remove_dir_all(&dir);
+        failures.sort();
+        failures.dedup();
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 }
