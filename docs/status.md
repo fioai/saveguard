@@ -20,7 +20,11 @@ What's been verified, and how:
   - Mutation checks (break the fix, watch the test fail) were done for the space reservation, the overwrite lock, the identity check before overwriting, and the shared-directory rule.
   - The setuid rule is the kernel's, read from `fs/attr.c` (`!capable(CAP_FSETID)`). A user-namespace experiment had suggested otherwise; see `docs/design.md`. Capability clearing was checked against the 6.18 kernel.
 - **Review:** an adversarial review agent went over everything on 2026-10-08 and found 15 problems, 2 of them security issues, plus some minor ones. All were fixed, with a regression test wherever this machine can run one (so not the Windows and macOS fixes). The exception is the Unix systems other than Linux and macOS, which are documented as a gap instead.
-- **macOS and Windows:** they compile and pass clippy (`--target aarch64-apple-darwin`, `x86_64-pc-windows-gnu`) but have never run. `.github/workflows/ci.yml` runs the tests on both once the repo is on GitHub. Expect the first run to find things.
+- **macOS and Windows:** CI (`.github/workflows/ci.yml`, GitHub Actions) runs every test on both on each push, green since 2026-10-08. Each has tests of its own (`tests/macos.rs`, `tests/windows.rs`).
+  - macOS passed from the first run.
+  - Windows needed a redesign. `ReplaceFileW` turned out not to be atomic (a reader found no file mid-save), so Windows now copies the metadata and renames atomically like Unix.
+  - Then the ACL matching had to learn that a replaced file's ACL can read as explicit copies of inherited entries. `docs/design.md` has the story.
+  - Locally the other platforms only get `cargo clippy --target …`.
 - **Not tested:** running as real root, NFS, FUSE, btrfs-specific flags (`+C`), SELinux labels.
 
 ## How to work
@@ -40,10 +44,10 @@ cargo fmt --all
 
 ## Next
 
-1. Push to GitHub and get CI green on macOS and Windows, fixing what it finds. The likeliest to be wrong:
-   - the macOS `xattr_preserve_for_intent` declaration;
-   - whether system xattrs like `com.apple.provenance` can be copied (if not, every macOS replace of such files becomes an overwrite);
-   - the Windows `ReplaceFileW` error handling and the private DACL (`create_private`).
+1. Things CI doesn't cover yet:
+   - macOS system xattrs like `com.apple.provenance` (if they can't be copied, every replace of such files becomes an overwrite);
+   - Windows owner mismatches (another user's file);
+   - Windows compression and encryption.
 2. Publish to crates.io once CI is green on all three platforms (ask first: it can't be undone).
 3. Fault-injection tests for the paths real file systems rarely take:
    - an xattr that won't copy, which should turn into an overwrite;

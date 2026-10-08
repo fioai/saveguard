@@ -97,10 +97,12 @@ The first version used `ReplaceFileW` instead, because it carries the metadata o
 
 What's matched, and how:
 
-- **Owner and ACL:** in `prepare`, before anything is written. If the owner differs from the staged file's (the original belongs to someone else), it's a failure, so Auto overwrites in place. Then the ACLs are compared byte for byte:
-  - the same (both inherited from the directory, the usual case): nothing to do;
-  - the original's is its own (protected): the staged file gets a copy (`SetSecurityInfo`);
-  - otherwise (entries of its own on top of inherited ones, or a directory whose ACL changed since): a failure, and the staged file is made private, since it's now only a copy to overwrite from.
+- **Owner and ACL:** in `prepare`, before anything is written. They're read from the file at the path now, which is the one being replaced. If the owner differs from the staged file's (the original belongs to someone else), it's a failure, so Auto overwrites in place. Then the ACLs:
+  - the original's is its own (protected): the staged file gets an exact copy (`SetSecurityInfo`);
+  - the same entries the staged file inherited from the directory (the usual case), whether or not they're marked as inherited: nothing to do;
+  - otherwise (an entry a new file wouldn't get, or a directory whose ACL changed since): a failure, and the staged file is made private, since it's now only a copy to overwrite from.
+
+  CI found why "marked as inherited or not" matters, with four threads saving one file. A handle opened on the original keeps reaching it after another save replaces it. Windows then moves the deleted file aside, and its ACL reads as the inherited entries turned into entries of its own. Reading through that handle lost the ACL on about a quarter of the saves. Reading by path took that to a few, and comparing the entries this way took it to none.
 - **Attributes and creation time:** hidden, system and not-indexed, plus the creation time, via `SetFileInformationByHandle(FileBasicInfo)`. A compression or encryption mismatch is a failure.
 - **Alternate data streams,** such as the `Zone.Identifier` that marks a downloaded file: enumerated with `FindFirstStreamW` and copied one by one.
 

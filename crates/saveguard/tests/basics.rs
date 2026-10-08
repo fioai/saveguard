@@ -372,9 +372,6 @@ fn concurrent_saves_leave_one_complete_version() {
         .into_iter()
         .flat_map(|t| t.join().unwrap())
         .collect();
-    for line in &odd {
-        eprintln!("{line}");
-    }
     assert!(
         odd.iter().all(|line| !line.starts_with("error")),
         "{odd:#?}"
@@ -444,10 +441,10 @@ fn a_replacement_keeps_the_creation_time() {
     assert_eq!(fs::metadata(&path).unwrap().created().unwrap(), created);
 }
 
-/// With the fallback to overwriting turned off, what replacing under contention runs into, if
-/// anything: the errors and losses are printed, and there should be none.
+/// Replacing while others replace the same file loses nothing and fails nothing. On Windows this
+/// once lost the ACL: the original read through a handle to a file another save had just deleted.
 #[test]
-fn concurrent_forced_replaces_say_what_they_hit() {
+fn concurrent_replaces_lose_nothing() {
     let dir = TempDir::new();
     let path = Arc::new(dir.join("a.txt"));
     fs::write(&*path, "start").unwrap();
@@ -474,8 +471,5 @@ fn concurrent_forced_replaces_say_what_they_hit() {
         .into_iter()
         .flat_map(|t| t.join().unwrap())
         .collect();
-    for line in &odd {
-        eprintln!("{line}");
-    }
     assert!(odd.is_empty(), "{odd:#?}");
 }

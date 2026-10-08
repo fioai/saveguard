@@ -97,8 +97,8 @@ There's more, with the reasoning for each, in [docs/design.md](docs/design.md).
 ## Platforms
 
 - **Linux:** tested, on ext4 and tmpfs. The bind-mount, full-disk and `/tmp` symlink-attack cases are tested in user namespaces.
-- **macOS:** compiles and passes clippy, but hasn't been run yet. It handles xattrs through the system's own safe-save rules (`xattr_preserve_for_intent`), ACLs, `chflags`, and creation dates.
-- **Windows:** compiles and passes clippy, but hasn't been run yet. It uses `ReplaceFileW`, which keeps attributes, ACLs and streams. It retries while virus scanners hold the file, and overwrites in place for hard links.
+- **macOS:** tested in CI. It handles xattrs through the system's own safe-save rules (`xattr_preserve_for_intent`), ACLs, `chflags`, and creation dates.
+- **Windows:** tested in CI. The new file gets the old one's ACL, attributes, creation time and alternate data streams (such as the downloaded-file mark), then an atomic rename puts it in place. Files it can't match (hard links, another owner, an ACL with entries of its own) are overwritten in place. It retries while virus scanners hold the file.
 - **Other Unix systems** (the BSDs, illumos): saving works, but extended attributes, ACLs and file flags aren't copied or detected, so a replacement can lose them. Use `Strategy::Overwrite` for files that have them.
 
 ## Limits
