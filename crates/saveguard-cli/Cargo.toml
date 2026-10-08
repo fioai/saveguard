@@ -3,6 +3,8 @@ name = "saveguard-cli"
 description = "Save standard input to a file without wrecking it: atomic when nothing would be lost, in place when something would."
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "saveguard"

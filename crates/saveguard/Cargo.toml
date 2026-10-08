@@ -3,6 +3,8 @@ name = "saveguard"
 description = "Save files without wrecking them: replace atomically when nothing would be lost, overwrite in place when something would, and report what happened."
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
 keywords = ["file", "save", "atomic", "write", "filesystem"]
 categories = ["filesystem"]
 

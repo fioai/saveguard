@@ -4,7 +4,7 @@ Where saveguard stands, how to work on it, and what's next. Read this first.
 
 ## State (2026-10-08)
 
-Version 0.1.0, not published. Three crates:
+Version 0.1.0, public at https://github.com/fioai/saveguard under the MIT license, not yet on crates.io. Three crates:
 
 - `crates/saveguard`: the library, with no dependencies beyond `libc` / `windows-sys`.
   - `writer.rs`: the decision (`decide`) and the save itself (`open`, `Pending::commit`).
@@ -44,7 +44,7 @@ cargo fmt --all
    - the macOS `xattr_preserve_for_intent` declaration;
    - whether system xattrs like `com.apple.provenance` can be copied (if not, every macOS replace of such files becomes an overwrite);
    - the Windows `ReplaceFileW` error handling and the private DACL (`create_private`).
-2. Decide the license (MIT OR Apache-2.0 is the Rust norm) before publishing to crates.io.
+2. Publish to crates.io once CI is green on all three platforms (ask first: it can't be undone).
 3. Fault-injection tests for the paths real file systems rarely take:
    - an xattr that won't copy, which should turn into an overwrite;
    - a rename refused for reasons other than a bind mount;

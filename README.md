@@ -119,3 +119,7 @@ saveguard collects what these already knew:
 - Qt's `QSaveFile`
 - Windows' `ReplaceFileW` and macOS's `FileManager.replaceItemAt`
 - the atomic-write libraries: `renameio`, `atomic-write-file`, `write-file-atomic`. They do the rename half.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
