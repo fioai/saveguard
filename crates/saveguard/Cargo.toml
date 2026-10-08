@@ -3,10 +3,15 @@ name = "saveguard"
 description = "Save files without wrecking them: replace atomically when nothing would be lost, overwrite in place when something would, and report what happened."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme.workspace = true
 keywords = ["file", "save", "atomic", "write", "filesystem"]
 categories = ["filesystem"]
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-pc-windows-msvc"]
 
 [target."cfg(unix)".dependencies]
 libc = "0.2.190"

@@ -3,8 +3,11 @@ name = "saveguard-capi"
 description = "The C API of saveguard: save files without wrecking them, from any language with a C FFI."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+# C programs build it from the repository; see the README.
+publish = false
 
 [lib]
 # libsaveguard.so / .dylib / .dll, and libsaveguard.a; see include/saveguard.h.

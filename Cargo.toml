@@ -7,3 +7,6 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/fioai/saveguard"
+readme = "README.md"
+# Checked with 1.77 and 1.76: C string literals need 1.77.
+rust-version = "1.77"
