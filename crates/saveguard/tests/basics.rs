@@ -443,3 +443,39 @@ fn a_replacement_keeps_the_creation_time() {
     assert_eq!(report.method, Method::Replaced, "{report}");
     assert_eq!(fs::metadata(&path).unwrap().created().unwrap(), created);
 }
+
+/// With the fallback to overwriting turned off, what replacing under contention runs into, if
+/// anything: the errors and losses are printed, and there should be none.
+#[test]
+fn concurrent_forced_replaces_say_what_they_hit() {
+    let dir = TempDir::new();
+    let path = Arc::new(dir.join("a.txt"));
+    fs::write(&*path, "start").unwrap();
+    let threads: Vec<_> = (0..4u8)
+        .map(|t| {
+            let path = Arc::clone(&path);
+            thread::spawn(move || {
+                let mut opts = Options::new();
+                opts.durability(Durability::None)
+                    .strategy(Strategy::Replace);
+                let mut odd = Vec::new();
+                for _ in 0..25 {
+                    match opts.save(&*path, vec![b'0' + t; 10_000]) {
+                        Ok(report) if report.lost.is_empty() => {}
+                        Ok(report) => odd.push(format!("lost: {report} {:?}", report.lost)),
+                        Err(e) => odd.push(format!("error: {e} ({e:?})")),
+                    }
+                }
+                odd
+            })
+        })
+        .collect();
+    let odd: Vec<String> = threads
+        .into_iter()
+        .flat_map(|t| t.join().unwrap())
+        .collect();
+    for line in &odd {
+        eprintln!("{line}");
+    }
+    assert!(odd.is_empty(), "{odd:#?}");
+}
