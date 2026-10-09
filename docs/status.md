@@ -48,7 +48,7 @@ cargo fmt --all
    - macOS system xattrs like `com.apple.provenance` (if they can't be copied, every replace of such files becomes an overwrite);
    - Windows owner mismatches (another user's file);
    - Windows compression and encryption.
-2. Publish to crates.io once CI is green on all three platforms (ask first: it can't be undone).
+2. Publish to crates.io. CI is green on all three platforms and the user approved publishing on 2026-10-08; it waits on their `cargo login`.
 3. Fault-injection tests for the paths real file systems rarely take:
    - an xattr that won't copy, which should turn into an overwrite;
    - a rename refused for reasons other than a bind mount;

@@ -10,4 +10,5 @@ Rules that are easy to break:
 
 - On any error except `Error::Interrupted`, the target must be untouched and the staged file removed. Tests check `leftovers()`.
 - Every behaviour claim in the docs should be backed by a test on real files, or marked untested.
+- Publishing to crates.io was approved by the user on 2026-10-08; it waits on them running `cargo login`. Then `cargo publish -p saveguard`, then `-p saveguard-cli` (`saveguard-capi` has `publish = false`), and add install lines to the README and `docs/status.md`. Pushing to `main` is fine.
 - Commit messages end with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
